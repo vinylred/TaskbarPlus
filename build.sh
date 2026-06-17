@@ -29,9 +29,11 @@ swiftc \
     -F "${PRIVATE_FW}" \
     -framework SkyLight \
     -framework AppKit \
+    Sources/TaskbarPlus/AppMenuBuilder.swift \
     Sources/TaskbarPlus/DockItem.swift \
     Sources/TaskbarPlus/DockModelService.swift \
     Sources/TaskbarPlus/LayoutConfig.swift \
+    Sources/TaskbarPlus/PreferencesController.swift \
     Sources/TaskbarPlus/WindowInfo.swift \
     Sources/TaskbarPlus/WindowControl.swift \
     Sources/TaskbarPlus/SpaceWindowService.swift \

@@ -13,7 +13,7 @@ final class TaskbarPanel: NSPanel {
     private static let barHeight: CGFloat = 60
     private static let horizontalPadding: CGFloat = 14
 
-    private let config = LayoutConfig.load()
+    private let config: LayoutConfig
 
     // Three horizontal zones the sections are distributed into.
     private let leftZone = NSStackView()
@@ -21,6 +21,7 @@ final class TaskbarPanel: NSPanel {
     private let rightZone = NSStackView()
 
     // Per-section content containers (filled by update*, then placed into a zone).
+    private let launcherStack = NSStackView()
     private let pinnedStack = NSStackView()
     private let runningStack = NSStackView()
     private let othersStack = NSStackView()
@@ -34,8 +35,9 @@ final class TaskbarPanel: NSPanel {
     /// it survives display reconfiguration.
     private let targetFrameOrigin: CGPoint
 
-    init(screen: NSScreen) {
+    init(screen: NSScreen, config: LayoutConfig) {
         self.targetFrameOrigin = screen.frame.origin
+        self.config = config
         super.init(
             contentRect: .zero,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -51,6 +53,10 @@ final class TaskbarPanel: NSPanel {
         hasShadow = true
         hidesOnDeactivate = false
         worksWhenModal = false
+        // ARC owns the panel (we keep it in a dictionary). Without this, AppKit would
+        // release it on close and ARC would over-release; with it, dropping our
+        // reference + orderOut lets it deallocate cleanly on reconfig.
+        isReleasedWhenClosed = false
 
         let blur = NSVisualEffectView()
         blur.material = .hudWindow
@@ -59,11 +65,12 @@ final class TaskbarPanel: NSPanel {
         blur.translatesAutoresizingMaskIntoConstraints = false
         contentView = blur
 
-        for s in [pinnedStack, runningStack, othersStack] {
+        for s in [launcherStack, pinnedStack, runningStack, othersStack] {
             s.orientation = .horizontal
             s.alignment = .centerY
             s.spacing = 8
         }
+        launcherStack.addArrangedSubview(LauncherButton())
 
         // Switcher: vertical stack of two horizontal rows.
         for row in [switcherRow1, switcherRow2] {
@@ -104,6 +111,10 @@ final class TaskbarPanel: NSPanel {
         orderFront(nil)
     }
 
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
     // Never become key/main, so clicking an icon doesn't deactivate the user's frontmost app.
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
@@ -123,8 +134,24 @@ final class TaskbarPanel: NSPanel {
     // MARK: - Update
 
     private var lastWindows: [WindowInfo] = []
+    private var dockSignature = ""
 
     func update(items: [DockItem]) {
+        // Skip the (relatively expensive) view rebuild when nothing changed — this
+        // is called many times per second under activity. Signature covers identity,
+        // label, section, and running-dot state.
+        let signature = items.map {
+            let id: String
+            switch $0.kind {
+            case .app(_, let url): id = url.path
+            case .folder(let url): id = url.path
+            case .trash: id = "trash"
+            }
+            return "\($0.section):\(id):\($0.label):\($0.isRunning)"
+        }.joined(separator: "|")
+        guard signature != dockSignature else { return }
+        dockSignature = signature
+
         for stack in [pinnedStack, runningStack, othersStack] {
             for v in stack.arrangedSubviews { stack.removeView(v) }
         }
@@ -151,6 +178,7 @@ final class TaskbarPanel: NSPanel {
     /// The content container view for each logical section.
     private func container(for section: Section) -> NSView {
         switch section {
+        case .launcher: return launcherStack
         case .pinned:   return pinnedStack
         case .running:  return runningStack
         case .others:   return othersStack
@@ -160,6 +188,8 @@ final class TaskbarPanel: NSPanel {
 
     private func isEmpty(_ section: Section) -> Bool {
         switch section {
+        case .launcher:
+            return false   // the Start button is always present
         case .pinned, .running, .others:
             return (container(for: section) as! NSStackView).arrangedSubviews.isEmpty
         case .switcher:
@@ -174,7 +204,7 @@ final class TaskbarPanel: NSPanel {
             for v in zone.arrangedSubviews { zone.removeView(v) }
         }
         // Stable section order within any zone.
-        let order: [Section] = [.pinned, .running, .others, .switcher]
+        let order: [Section] = [.launcher, .pinned, .running, .others, .switcher]
         for zoneKind in [Zone.left, .center, .right] {
             let stack = zoneStack(zoneKind)
             let members = order.filter { config.zone(for: $0) == zoneKind && !isEmpty($0) }
@@ -197,48 +227,42 @@ final class TaskbarPanel: NSPanel {
         switcherExpandConstraints = []
 
         let expand = config.expand(for: .switcher)
-        let stretching = expand != nil && !isEmpty(.switcher)
+        let align = config.align(for: .switcher)
 
-        let dist: NSStackView.Distribution = stretching ? .fillEqually : .fill
-        switcherRow1.distribution = dist
-        switcherRow2.distribution = dist
-        switcherStack.alignment = .trailing
+        switcherRow1.distribution = .fill
+        switcherRow2.distribution = .fill
+        // Vertical stack's horizontal alignment positions the button rows within the
+        // switcher's area, per `align`.
+        switch align {
+        case .left:   switcherStack.alignment = .leading
+        case .center: switcherStack.alignment = .centerX
+        case .right:  switcherStack.alignment = .trailing
+        }
 
-        guard stretching, let blur = contentView else { return }
+        // Pin the switcher to its available AREA (the gap between the flanking Dock
+        // zones) whenever expand is set OR a non-default align is requested — both
+        // need room wider than the buttons to act within. Otherwise it stays a
+        // normal content-sized zone member.
+        let needsArea = (expand != nil || align != .left) && !isEmpty(.switcher)
+        guard needsArea, let blur = contentView else { return }
 
-        // Remove the switcher from whatever zone stack reassembleZones put it in,
-        // and pin it directly to the blur between fixed edges.
         (switcherStack.superview as? NSStackView)?.removeView(switcherStack)
         if switcherStack.superview == nil { blur.addSubview(switcherStack) }
         switcherStack.translatesAutoresizingMaskIntoConstraints = false
 
         let pad = Self.horizontalPadding
         let gap: CGFloat = 16
-        let zone = config.zone(for: .switcher)
+        let leftEdge = pad + dockZoneWidth(.left) + (dockZoneWidth(.left) > 0 ? gap : 0)
+        let rightEdge = pad + dockZoneWidth(.right) + (dockZoneWidth(.right) > 0 ? gap : 0)
 
-        // Compute the fixed left/right edges of the gap the switcher fills.
-        let leftBlock = pad + dockZoneWidth(.left)
-        let rightBlock = pad + dockZoneWidth(.right)
-        let leftEdge = leftBlock + (dockZoneWidth(.left) > 0 ? gap : 0)
-        let rightEdge = rightBlock + (dockZoneWidth(.right) > 0 ? gap : 0)
-
-        var cons: [NSLayoutConstraint] = [
-            switcherStack.centerYAnchor.constraint(equalTo: blur.centerYAnchor)
+        // The area spans from the left flank's right edge to the right flank's left
+        // edge. expand:left/right would bias the area, but since we now always span
+        // the full gap and use `align` to position content, both behave the same.
+        let cons: [NSLayoutConstraint] = [
+            switcherStack.centerYAnchor.constraint(equalTo: blur.centerYAnchor),
+            switcherStack.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: leftEdge),
+            switcherStack.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -rightEdge),
         ]
-        switch expand {
-        case .right:
-            // Start at the left flank (or screen-left if Dock not on left), grow to
-            // the right flank's left edge.
-            let start = (zone == .left || dockZoneWidth(.left) > 0) ? leftEdge : pad
-            cons.append(switcherStack.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: start))
-            cons.append(switcherStack.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -rightEdge))
-        case .left:
-            let end = (zone == .right || dockZoneWidth(.right) > 0) ? rightEdge : pad
-            cons.append(switcherStack.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: leftEdge))
-            cons.append(switcherStack.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -end))
-        case nil:
-            break
-        }
         NSLayoutConstraint.activate(cons)
         switcherExpandConstraints = cons
     }
@@ -457,6 +481,62 @@ final class TaskbarPanel: NSPanel {
         var err: NSDictionary?
         script?.executeAndReturnError(&err)
     }
+
+    // MARK: - Window (task-switcher) context menu
+
+    /// Boxes a WindowInfo so it can ride in NSMenuItem.representedObject.
+    private final class WindowBox { let info: WindowInfo; init(_ i: WindowInfo) { info = i } }
+
+    func makeWindowMenu(for info: WindowInfo) -> NSMenu {
+        let menu = NSMenu()
+        let box = WindowBox(info)
+        func add(_ title: String, _ selector: Selector) {
+            let mi = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = box
+            menu.addItem(mi)
+        }
+        add("Raise Window", #selector(winRaise(_:)))
+        add("Show All Windows", #selector(winShowAll(_:)))
+        add("Hide", #selector(winHide(_:)))
+        menu.addItem(.separator())
+        add("Show in Finder", #selector(winShowInFinder(_:)))
+        menu.addItem(.separator())
+        add("Quit", #selector(winQuit(_:)))
+        return menu
+    }
+
+    private func win(from sender: NSMenuItem) -> WindowInfo? {
+        (sender.representedObject as? WindowBox)?.info
+    }
+
+    @objc private func winRaise(_ sender: NSMenuItem) {
+        if let w = win(from: sender) { raiseWindow(w) }
+    }
+    @objc private func winShowAll(_ sender: NSMenuItem) {
+        guard let pid = win(from: sender)?.pid,
+              let app = NSRunningApplication(processIdentifier: pid) else { return }
+        app.unhide(); app.activate()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            CoreDockSendNotification("com.apple.expose.front.awake" as CFString, 0)
+        }
+    }
+    @objc private func winHide(_ sender: NSMenuItem) {
+        if let pid = win(from: sender)?.pid {
+            NSRunningApplication(processIdentifier: pid)?.hide()
+        }
+    }
+    @objc private func winQuit(_ sender: NSMenuItem) {
+        if let pid = win(from: sender)?.pid {
+            NSRunningApplication(processIdentifier: pid)?.terminate()
+        }
+    }
+    @objc private func winShowInFinder(_ sender: NSMenuItem) {
+        if let pid = win(from: sender)?.pid,
+           let url = NSRunningApplication(processIdentifier: pid)?.bundleURL {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
+    }
 }
 
 /// One Dock icon: an image-only button plus a running-dot drawn beneath it.
@@ -598,6 +678,7 @@ final class WindowButton: NSView {
         addSubview(iconView)
         addSubview(label)
         toolTip = info.displayTitle
+        self.menu = panel.makeWindowMenu(for: info)
 
         // Fixed-width box so every task button is identical (Win95 style); the
         // label truncates within it rather than letting the stack size buttons
@@ -623,17 +704,34 @@ final class WindowButton: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    override func mouseDown(with event: NSEvent) {
-        pressed = true
+    private func setPressed(_ v: Bool) {
+        guard pressed != v else { return }
+        pressed = v
         needsDisplay = true
     }
 
+    override func mouseDown(with event: NSEvent) {
+        setPressed(true)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        // Track whether the cursor is still over the button while held.
+        setPressed(bounds.contains(convert(event.locationInWindow, from: nil)))
+    }
+
     override func mouseUp(with event: NSEvent) {
-        pressed = false
-        needsDisplay = true
-        if bounds.contains(convert(event.locationInWindow, from: nil)) {
-            panel?.raiseWindow(info)
-        }
+        let inside = bounds.contains(convert(event.locationInWindow, from: nil))
+        // Clear the pressed look BEFORE raising the window — raising changes focus
+        // and can interrupt the run loop, which previously left the button stuck.
+        setPressed(false)
+        if inside { panel?.raiseWindow(info) }
+    }
+
+    // Right-click / control-click shows the context menu via `self.menu`; ensure the
+    // pressed state never sticks if a right-click interrupts a left-press.
+    override func rightMouseDown(with event: NSEvent) {
+        setPressed(false)
+        super.rightMouseDown(with: event)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -656,5 +754,55 @@ final class WindowButton: NSView {
         let br = NSBezierPath()
         br.move(to: NSPoint(x: r.minX, y: r.minY)); br.line(to: NSPoint(x: r.maxX, y: r.minY))
         br.line(to: NSPoint(x: r.maxX, y: r.maxY)); br.lineWidth = 1; br.stroke()
+    }
+}
+
+/// Win95 Start-style launcher: a button that pops up the application menu built
+/// from /Applications + Utilities. Rebuilds the menu fresh on each click so newly
+/// installed apps show up.
+final class LauncherButton: NSView {
+
+    private let builder = AppMenuBuilder()
+    private let button = NSButton()
+
+    init() {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+
+        let icon = NSImage(systemSymbolName: "square.grid.2x2.fill",
+                           accessibilityDescription: "Applications")
+        button.image = icon
+        button.imagePosition = .imageLeading
+        button.title = "Apps"
+        button.font = .boldSystemFont(ofSize: 11)
+        button.bezelStyle = .rounded
+        button.controlSize = .small
+        button.target = self
+        button.action = #selector(showMenu)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(button)
+
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: TaskbarPanel.iconSize),
+            button.centerYAnchor.constraint(equalTo: centerYAnchor),
+            button.leadingAnchor.constraint(equalTo: leadingAnchor),
+            button.trailingAnchor.constraint(equalTo: trailingAnchor),
+            button.heightAnchor.constraint(equalToConstant: 26),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil { builder.prewarm() }   // build the menu before first click
+    }
+
+    @objc private func showMenu() {
+        // Cached: only rebuilds when /Applications actually changed.
+        let menu = builder.menu()
+        // Pop up just above the button (the bar sits at the screen's bottom edge).
+        let origin = NSPoint(x: 0, y: bounds.height + 4)
+        menu.popUp(positioning: nil, at: origin, in: self)
     }
 }

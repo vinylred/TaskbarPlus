@@ -40,13 +40,13 @@ final class DockModelService {
     func start() {
         readDockPlist()
 
-        // Re-read the Dock config when it changes, plus on app foreground.
+        // Re-read the Dock config only when it actually changes. (We deliberately do
+        // NOT re-read on every app activation — the pinned/folder config is static,
+        // and re-reading the plist + reparsing on each app switch is wasteful for a
+        // 24x7 process. Running-state changes flow in via updateRunning instead.)
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(dockPrefsChanged),
             name: NSNotification.Name("com.apple.dock.prefchanged"), object: nil)
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self, selector: #selector(dockPrefsChanged),
-            name: NSWorkspace.didActivateApplicationNotification, object: nil)
 
         watchTrash()
         rebuild()
@@ -86,6 +86,9 @@ final class DockModelService {
 
         pinned = apps.compactMap { parseApp($0) }
         folders = others.compactMap { parseFolder($0) }
+        // Dock config changed → app set may have changed; drop cached icons so they
+        // re-resolve once (e.g. an app was replaced/updated).
+        iconCache.removeAll()
     }
 
     private func parseApp(_ entry: [String: Any]) -> ParsedApp? {
@@ -115,14 +118,18 @@ final class DockModelService {
     // MARK: - Trash watching
 
     private func watchTrash() {
-        trashFD = open(trashURL.path, O_EVTONLY)
-        guard trashFD >= 0 else { return }
+        // Re-entrant safe: tear down any existing watch first (cancel closes its fd).
+        trashSource?.cancel()
+        trashSource = nil
+
+        let fd = open(trashURL.path, O_EVTONLY)
+        guard fd >= 0 else { return }
+        trashFD = fd
         let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: trashFD, eventMask: [.write, .delete, .rename], queue: .main)
+            fileDescriptor: fd, eventMask: [.write, .delete, .rename], queue: .main)
         source.setEventHandler { [weak self] in self?.rebuild() }
-        source.setCancelHandler { [weak self] in
-            if let fd = self?.trashFD, fd >= 0 { close(fd) }
-        }
+        // Capture this source's own fd so a later re-watch can't close the wrong one.
+        source.setCancelHandler { close(fd) }
         source.resume()
         trashSource = source
     }
@@ -134,9 +141,16 @@ final class DockModelService {
 
     // MARK: - Icon resolution
 
+    /// Path-keyed icon cache. rebuild() runs many times per second under activity;
+    /// without this it would hit NSWorkspace.icon(forFile:) (disk + IconServices)
+    /// for every pinned app/folder every time.
+    private var iconCache: [String: NSImage] = [:]
+
     private func appIcon(for url: URL) -> NSImage {
+        if let cached = iconCache[url.path] { return cached }
         let icon = NSWorkspace.shared.icon(forFile: url.path)
         icon.size = Self.iconSize
+        iconCache[url.path] = icon
         return icon
     }
 

@@ -1,9 +1,11 @@
 import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let config = LayoutConfig.load()
+    private var config = LayoutConfig.load()
     private let service = SpaceWindowService()
     private let dockModel = DockModelService()
+    private var prefs: PreferencesController?
+    private var statusItem: NSStatusItem?
 
     /// One panel per target screen, keyed by a string of the screen's frame origin
     /// (CGPoint isn't Hashable before macOS 15).
@@ -14,6 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func key(_ origin: CGPoint) -> String { "\(origin.x),\(origin.y)" }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        setupStatusItem()
         rebuildPanels()
 
         // Dock model is shared across all bars (same Dock content everywhere).
@@ -46,6 +49,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         distributeWindows()
     }
 
+    // MARK: - Status item + Preferences
+
+    private func setupStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.image = NSImage(systemSymbolName: "menubar.dock.rectangle",
+                                     accessibilityDescription: "Taskbar Plus")
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Taskbar Plus", action: nil, keyEquivalent: ""))
+        menu.addItem(.separator())
+        let prefItem = NSMenuItem(title: "Preferences…", action: #selector(openPreferences), keyEquivalent: ",")
+        prefItem.target = self
+        menu.addItem(prefItem)
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit Taskbar Plus", action: #selector(NSApplication.terminate(_:)),
+                                keyEquivalent: "q"))
+        item.menu = menu
+        statusItem = item
+    }
+
+    @objc private func openPreferences() {
+        if prefs == nil {
+            prefs = PreferencesController(config: config) { [weak self] newConfig in
+                self?.apply(newConfig)
+            }
+        }
+        prefs?.show()
+    }
+
+    /// Live-apply a new config: persist it, swap it in, and rebuild the bars.
+    private func apply(_ newConfig: LayoutConfig) {
+        config = newConfig
+        newConfig.save()
+        // Panels read config at init, so recreate them all. close() (with
+        // isReleasedWhenClosed=false) removes them from AppKit's window list so ARC
+        // can deallocate once we drop our reference.
+        panels.values.forEach { $0.close() }
+        panels = [:]
+        rebuildPanels()
+        panels.values.forEach { $0.update(items: latestItems) }
+        distributeWindows()
+    }
+
     /// Target screens per config: just the primary/Dock monitor, or all of them.
     private func targetScreens() -> [NSScreen] {
         switch config.monitors {
@@ -64,12 +109,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Drop panels for screens no longer targeted.
         for (k, panel) in panels where !wantedKeys.contains(k) {
-            panel.orderOut(nil)
+            panel.close()
             panels[k] = nil
         }
         // Create panels for newly-targeted screens.
         for screen in wanted where panels[key(screen.frame.origin)] == nil {
-            panels[key(screen.frame.origin)] = TaskbarPanel(screen: screen)
+            panels[key(screen.frame.origin)] = TaskbarPanel(screen: screen, config: config)
         }
     }
 
