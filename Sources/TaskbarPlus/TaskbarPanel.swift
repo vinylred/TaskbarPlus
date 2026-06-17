@@ -57,9 +57,14 @@ final class TaskbarPanel: NSPanel {
         // release it on close and ARC would over-release; with it, dropping our
         // reference + orderOut lets it deallocate cleanly on reconfig.
         isReleasedWhenClosed = false
+        // Theme: nil = follow the OS (auto); else force light/dark. This drives the
+        // visual-effect view, label colors, and the Win95 buttons' effectiveAppearance.
+        appearance = config.theme.appearance
 
         let blur = NSVisualEffectView()
-        blur.material = .hudWindow
+        // `.sidebar` adapts cleanly to both light and dark (the old `.hudWindow` was
+        // always dark regardless of appearance).
+        blur.material = .sidebar
         blur.blendingMode = .behindWindow
         blur.state = .active
         blur.translatesAutoresizingMaskIntoConstraints = false
@@ -735,13 +740,25 @@ final class WindowButton: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
+        // Bevel colors adapt to the effective appearance (light vs dark theme).
+        let isDark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        let face: NSColor
+        let light: NSColor
+        let dark: NSColor
+        if isDark {
+            face = pressed ? NSColor(white: 0.22, alpha: 0.95) : NSColor(white: 0.32, alpha: 0.95)
+            light = NSColor(white: 0.55, alpha: 0.9)   // raised highlight
+            dark  = NSColor(white: 0.10, alpha: 0.9)   // raised shadow
+        } else {
+            face = pressed ? NSColor(white: 0.78, alpha: 0.9) : NSColor(white: 0.86, alpha: 0.9)
+            light = NSColor.white.withAlphaComponent(0.9)
+            dark  = NSColor(white: 0.45, alpha: 0.9)
+        }
+
         let r = bounds.insetBy(dx: 0.5, dy: 0.5)
-        // Win95 raised-button bevel: light top-left, dark bottom-right.
-        (pressed ? NSColor(white: 0.78, alpha: 0.9) : NSColor(white: 0.86, alpha: 0.9)).setFill()
+        face.setFill()
         NSBezierPath(rect: r).fill()
 
-        let light = NSColor.white.withAlphaComponent(0.9)
-        let dark = NSColor(white: 0.45, alpha: 0.9)
         let topLeft = pressed ? dark : light
         let bottomRight = pressed ? light : dark
 

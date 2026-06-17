@@ -13,10 +13,12 @@ final class PreferencesController: NSObject {
     private var expandPickers: [Section: NSSegmentedControl] = [:]
     private var alignPickers: [Section: NSSegmentedControl] = [:]
     private var monitorsPicker: NSSegmentedControl!
+    private var themePicker: NSSegmentedControl!
 
     private static let zones: [Zone] = [.left, .center, .right]
     private static let expands: [Expand?] = [nil, .left, .right]
     private static let aligns: [Align] = [.left, .center, .right]
+    private static let themes: [Theme] = [.auto, .light, .dark]
 
     init(config: LayoutConfig, onChange: @escaping (LayoutConfig) -> Void) {
         self.config = config
@@ -25,7 +27,8 @@ final class PreferencesController: NSObject {
         let width: CGFloat = 620
         let rowH: CGFloat = 40
         let sections = Section.allCases
-        let height = CGFloat(sections.count + 1) * rowH + 90
+        // sections + Monitors row + Theme row.
+        let height = CGFloat(sections.count + 2) * rowH + 90
 
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
@@ -115,6 +118,17 @@ final class PreferencesController: NSObject {
         content.addSubview(mon)
         monitorsPicker = mon
 
+        // Theme row.
+        y -= rowH
+        content.addSubview(label("Theme", NSRect(x: 20, y: y, width: 95, height: 22), bold: true))
+        let theme = NSSegmentedControl(labels: ["Auto", "Light", "Dark"],
+                                       trackingMode: .selectOne,
+                                       target: self, action: #selector(changed))
+        theme.frame = NSRect(x: 120, y: y - 2, width: 220, height: 24)
+        theme.selectedSegment = Self.themes.firstIndex(of: config.theme) ?? 0
+        content.addSubview(theme)
+        themePicker = theme
+
         window.contentView = content
     }
 
@@ -134,7 +148,8 @@ final class PreferencesController: NSObject {
             placements[section] = Placement(zone: zone, expand: expand, align: align)
         }
         let monitors: Monitors = (monitorsPicker.selectedSegment == 1) ? .all : .dock
-        config = LayoutConfig(placements: placements, monitors: monitors)
+        let theme = Self.themes[themePicker.selectedSegment]
+        config = LayoutConfig(placements: placements, monitors: monitors, theme: theme)
         onChange(config)
     }
 }

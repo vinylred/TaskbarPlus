@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 
 /// Horizontal zone a section is anchored in.
 enum Zone: String {
@@ -20,6 +20,22 @@ enum Align: String {
 enum Monitors: String {
     case dock   // only the primary / Dock monitor (default)
     case all    // one bar per monitor, each scoped to that monitor's windows
+}
+
+/// Bar appearance.
+enum Theme: String {
+    case auto   // follow the system appearance (default)
+    case light
+    case dark
+
+    /// The NSAppearance to force, or nil to follow the system.
+    var appearance: NSAppearance? {
+        switch self {
+        case .auto:  return nil
+        case .light: return NSAppearance(named: .aqua)
+        case .dark:  return NSAppearance(named: .darkAqua)
+        }
+    }
 }
 
 /// The logical sections of the bar.
@@ -48,6 +64,7 @@ struct Placement {
 struct LayoutConfig {
     var placements: [Section: Placement]
     var monitors: Monitors
+    var theme: Theme
 
     static let configPath = URL(fileURLWithPath: NSString("~/.taskbarplus.json").expandingTildeInPath)
 
@@ -57,7 +74,7 @@ struct LayoutConfig {
         .running:  Placement(zone: .left,  expand: nil, align: .left),
         .others:   Placement(zone: .right, expand: nil, align: .right),
         .switcher: Placement(zone: .center, expand: .right, align: .left),
-    ], monitors: .dock)
+    ], monitors: .dock, theme: .auto)
 
     static func load() -> LayoutConfig {
         guard let data = try? Data(contentsOf: configPath),
@@ -78,7 +95,8 @@ struct LayoutConfig {
             }
         }
         let monitors = (raw["monitors"] as? String).flatMap(Monitors.init) ?? .dock
-        return LayoutConfig(placements: placements, monitors: monitors)
+        let theme = (raw["theme"] as? String).flatMap(Theme.init) ?? .auto
+        return LayoutConfig(placements: placements, monitors: monitors, theme: theme)
     }
 
     func placement(for section: Section) -> Placement {
@@ -91,7 +109,7 @@ struct LayoutConfig {
 
     /// Serialize to ~/.taskbarplus.json (pretty-printed, sorted keys).
     func save() {
-        var root: [String: Any] = ["monitors": monitors.rawValue]
+        var root: [String: Any] = ["monitors": monitors.rawValue, "theme": theme.rawValue]
         for section in Section.allCases {
             let p = placement(for: section)
             // Use the compact string form only when there's nothing but a zone.
