@@ -1,0 +1,660 @@
+import AppKit
+import CSkyLight
+
+/// A borderless, non-activating panel that floats a Dock-style row of icons along
+/// the bottom edge of the main screen and stays visible on every Space.
+///
+/// Layout mirrors the real Dock: [pinned] | [running-only] | [folders + Trash],
+/// with separators only between non-empty sections and a running-dot under each
+/// running app. Each icon hosts a right-click context menu.
+final class TaskbarPanel: NSPanel {
+
+    static let iconSize: CGFloat = 40
+    private static let barHeight: CGFloat = 60
+    private static let horizontalPadding: CGFloat = 14
+
+    private let config = LayoutConfig.load()
+
+    // Three horizontal zones the sections are distributed into.
+    private let leftZone = NSStackView()
+    private let centerZone = NSStackView()
+    private let rightZone = NSStackView()
+
+    // Per-section content containers (filled by update*, then placed into a zone).
+    private let pinnedStack = NSStackView()
+    private let runningStack = NSStackView()
+    private let othersStack = NSStackView()
+
+    /// Win95-style task switcher: one button per window, across two rows.
+    private let switcherStack = NSStackView()
+    private let switcherRow1 = NSStackView()
+    private let switcherRow2 = NSStackView()
+
+    /// The screen this bar lives on. Resolved fresh by frame on each reposition so
+    /// it survives display reconfiguration.
+    private let targetFrameOrigin: CGPoint
+
+    init(screen: NSScreen) {
+        self.targetFrameOrigin = screen.frame.origin
+        super.init(
+            contentRect: .zero,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+
+        isFloatingPanel = true
+        level = .statusBar
+        collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+        backgroundColor = .clear
+        isOpaque = false
+        hasShadow = true
+        hidesOnDeactivate = false
+        worksWhenModal = false
+
+        let blur = NSVisualEffectView()
+        blur.material = .hudWindow
+        blur.blendingMode = .behindWindow
+        blur.state = .active
+        blur.translatesAutoresizingMaskIntoConstraints = false
+        contentView = blur
+
+        for s in [pinnedStack, runningStack, othersStack] {
+            s.orientation = .horizontal
+            s.alignment = .centerY
+            s.spacing = 8
+        }
+
+        // Switcher: vertical stack of two horizontal rows.
+        for row in [switcherRow1, switcherRow2] {
+            row.orientation = .horizontal
+            row.alignment = .centerY
+            row.spacing = 4
+        }
+        switcherStack.orientation = .vertical
+        switcherStack.alignment = .trailing
+        switcherStack.spacing = 4
+        switcherStack.addArrangedSubview(switcherRow1)
+        switcherStack.addArrangedSubview(switcherRow2)
+
+        // Three zones across the bar: left edge, center, right edge.
+        for z in [leftZone, centerZone, rightZone] {
+            z.orientation = .horizontal
+            z.alignment = .centerY
+            z.spacing = 10
+            z.translatesAutoresizingMaskIntoConstraints = false
+            blur.addSubview(z)
+            z.centerYAnchor.constraint(equalTo: blur.centerYAnchor).isActive = true
+        }
+        NSLayoutConstraint.activate([
+            leftZone.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: Self.horizontalPadding),
+            centerZone.centerXAnchor.constraint(equalTo: blur.centerXAnchor),
+            rightZone.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -Self.horizontalPadding),
+            // Hard no-overlap guards: zones must keep clear of their neighbours so a
+            // crowded zone can never render on top of another.
+            centerZone.leadingAnchor.constraint(greaterThanOrEqualTo: leftZone.trailingAnchor, constant: 16),
+            rightZone.leadingAnchor.constraint(greaterThanOrEqualTo: centerZone.trailingAnchor, constant: 16),
+        ])
+
+        reposition()
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(reposition),
+            name: NSApplication.didChangeScreenParametersNotification, object: nil)
+
+        orderFront(nil)
+    }
+
+    // Never become key/main, so clicking an icon doesn't deactivate the user's frontmost app.
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+
+    @objc private func reposition() {
+        // Re-resolve our screen by its frame origin (survives reconfiguration);
+        // fall back to primary if it's gone.
+        let screen = NSScreen.screens.first(where: { $0.frame.origin == targetFrameOrigin })
+            ?? NSScreen.screens.first(where: { $0.frame.origin == .zero })
+            ?? NSScreen.screens.first
+        guard let screen else { return }
+        let vf = screen.visibleFrame
+        let frame = NSRect(x: vf.minX, y: vf.minY, width: vf.width, height: Self.barHeight)
+        setFrame(frame, display: true)
+    }
+
+    // MARK: - Update
+
+    private var lastWindows: [WindowInfo] = []
+
+    func update(items: [DockItem]) {
+        for stack in [pinnedStack, runningStack, othersStack] {
+            for v in stack.arrangedSubviews { stack.removeView(v) }
+        }
+        for item in items {
+            let view = DockIconView(item: item, panel: self)
+            switch item.section {
+            case .pinned:  pinnedStack.addArrangedSubview(view)
+            case .running: runningStack.addArrangedSubview(view)
+            case .others:  othersStack.addArrangedSubview(view)
+            }
+        }
+        reassembleZones()
+        // If the Dock's icon count changed, its width changed, so the switcher's
+        // capacity must be recomputed. Otherwise leave the switcher untouched.
+        let count = dockStacks().reduce(0) { $0 + $1.arrangedSubviews.count }
+        if count != lastDockCount {
+            lastDockCount = count
+            rebuildSwitcher(lastWindows, force: true)
+        }
+    }
+
+    private var lastDockCount = -1
+
+    /// The content container view for each logical section.
+    private func container(for section: Section) -> NSView {
+        switch section {
+        case .pinned:   return pinnedStack
+        case .running:  return runningStack
+        case .others:   return othersStack
+        case .switcher: return switcherStack
+        }
+    }
+
+    private func isEmpty(_ section: Section) -> Bool {
+        switch section {
+        case .pinned, .running, .others:
+            return (container(for: section) as! NSStackView).arrangedSubviews.isEmpty
+        case .switcher:
+            return switcherRow1.arrangedSubviews.isEmpty && switcherRow2.arrangedSubviews.isEmpty
+        }
+    }
+
+    /// Place each non-empty section into its configured zone, in a fixed section
+    /// order, with separators between adjacent sections inside a zone.
+    private func reassembleZones() {
+        for zone in [leftZone, centerZone, rightZone] {
+            for v in zone.arrangedSubviews { zone.removeView(v) }
+        }
+        // Stable section order within any zone.
+        let order: [Section] = [.pinned, .running, .others, .switcher]
+        for zoneKind in [Zone.left, .center, .right] {
+            let stack = zoneStack(zoneKind)
+            let members = order.filter { config.zone(for: $0) == zoneKind && !isEmpty($0) }
+            for (i, section) in members.enumerated() {
+                if i > 0 { stack.addArrangedSubview(makeSeparator()) }
+                stack.addArrangedSubview(container(for: section))
+            }
+        }
+        applySwitcherExpand()
+    }
+
+    private var switcherExpandConstraints: [NSLayoutConstraint] = []
+
+    /// If the switcher is configured to expand, pull it OUT of its zone stack and
+    /// pin its edges directly to the blur so it spans exactly the gap toward the
+    /// expand edge — its buttons then stretch (.fillEqually) to fill it. No feedback
+    /// loop, no overshoot. If not expanding, it stays a normal zone member.
+    private func applySwitcherExpand() {
+        NSLayoutConstraint.deactivate(switcherExpandConstraints)
+        switcherExpandConstraints = []
+
+        let expand = config.expand(for: .switcher)
+        let stretching = expand != nil && !isEmpty(.switcher)
+
+        let dist: NSStackView.Distribution = stretching ? .fillEqually : .fill
+        switcherRow1.distribution = dist
+        switcherRow2.distribution = dist
+        switcherStack.alignment = .trailing
+
+        guard stretching, let blur = contentView else { return }
+
+        // Remove the switcher from whatever zone stack reassembleZones put it in,
+        // and pin it directly to the blur between fixed edges.
+        (switcherStack.superview as? NSStackView)?.removeView(switcherStack)
+        if switcherStack.superview == nil { blur.addSubview(switcherStack) }
+        switcherStack.translatesAutoresizingMaskIntoConstraints = false
+
+        let pad = Self.horizontalPadding
+        let gap: CGFloat = 16
+        let zone = config.zone(for: .switcher)
+
+        // Compute the fixed left/right edges of the gap the switcher fills.
+        let leftBlock = pad + dockZoneWidth(.left)
+        let rightBlock = pad + dockZoneWidth(.right)
+        let leftEdge = leftBlock + (dockZoneWidth(.left) > 0 ? gap : 0)
+        let rightEdge = rightBlock + (dockZoneWidth(.right) > 0 ? gap : 0)
+
+        var cons: [NSLayoutConstraint] = [
+            switcherStack.centerYAnchor.constraint(equalTo: blur.centerYAnchor)
+        ]
+        switch expand {
+        case .right:
+            // Start at the left flank (or screen-left if Dock not on left), grow to
+            // the right flank's left edge.
+            let start = (zone == .left || dockZoneWidth(.left) > 0) ? leftEdge : pad
+            cons.append(switcherStack.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: start))
+            cons.append(switcherStack.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -rightEdge))
+        case .left:
+            let end = (zone == .right || dockZoneWidth(.right) > 0) ? rightEdge : pad
+            cons.append(switcherStack.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: leftEdge))
+            cons.append(switcherStack.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -end))
+        case nil:
+            break
+        }
+        NSLayoutConstraint.activate(cons)
+        switcherExpandConstraints = cons
+    }
+
+    /// Estimated rendered width of the Dock sections in a given zone.
+    private func dockZoneWidth(_ zone: Zone) -> CGFloat {
+        let secs: [Section] = [.pinned, .running, .others].filter {
+            config.zone(for: $0) == zone && !isEmpty($0)
+        }
+        guard !secs.isEmpty else { return 0 }
+        let icons = secs.reduce(0) { $0 + ((container(for: $1) as? NSStackView)?.arrangedSubviews.count ?? 0) }
+        return CGFloat(icons) * (Self.iconSize + 8) + CGFloat(secs.count - 1) * 20
+    }
+
+    private func zoneStack(_ zone: Zone) -> NSStackView {
+        switch zone {
+        case .left:   return leftZone
+        case .center: return centerZone
+        case .right:  return rightZone
+        }
+    }
+
+    private var switcherSignature = ""
+
+    /// Entry point from the window service.
+    func updateWindows(_ windows: [WindowInfo]) {
+        lastWindows = windows
+        rebuildSwitcher(windows, force: false)
+    }
+
+    /// Rebuild the Win95-style task-switcher strip. Skips work when the window set
+    /// is unchanged (unless `force`, e.g. the Dock width changed so capacity must
+    /// be recomputed).
+    private func rebuildSwitcher(_ windows: [WindowInfo], force: Bool) {
+        let signature = windows.map { "\($0.windowNumber):\($0.displayTitle)" }.joined(separator: "|")
+        if !force, signature == switcherSignature { return }
+        switcherSignature = signature
+
+        for v in switcherRow1.arrangedSubviews { switcherRow1.removeView(v) }
+        for v in switcherRow2.arrangedSubviews { switcherRow2.removeView(v) }
+
+        let perRow = max(1, switcherPerRowCapacity())
+
+        // Split across two rows; cap to what fits so it never overflows the screen.
+        let capacity = perRow * 2
+        let shown = Array(windows.prefix(capacity))
+        let topCount = min(perRow, shown.count)   // fill the top row first
+        for (i, w) in shown.enumerated() {
+            let row = i < topCount ? switcherRow1 : switcherRow2
+            row.addArrangedSubview(WindowButton(info: w, panel: self))
+        }
+        // Hide an empty second row so a single row stays vertically centered.
+        switcherRow2.isHidden = switcherRow2.arrangedSubviews.isEmpty
+        reassembleZones()
+
+        if ProcessInfo.processInfo.environment["TBP_DEBUG"] != nil {
+            contentView?.layoutSubtreeIfNeeded()
+            NSLog("switcher: panelW=\(frame.width) perRow=\(perRow) shown=\(shown.count)/\(windows.count) force=\(force)")
+        }
+    }
+
+    /// Max Win95 buttons that fit per row, given the switcher's zone and the space
+    /// the other (Dock) sections consume. Guarantees the strip never overflows the
+    /// screen, wherever the switcher is placed.
+    private func switcherPerRowCapacity() -> Int {
+        let screenW = frame.width > 0 ? frame.width : (NSScreen.screens.first?.frame.width ?? 1512)
+        let pad = Self.horizontalPadding
+        let gap: CGFloat = 16
+
+        // Estimated width of the Dock sections (pinned/running/others) that sit in
+        // each zone, from icon COUNT (timing-independent, unlike fittingSize which
+        // is 0 before the first layout pass).
+        func dockWidth(in zone: Zone) -> CGFloat {
+            let secs: [Section] = [.pinned, .running, .others].filter {
+                config.zone(for: $0) == zone && !isEmpty($0)
+            }
+            guard !secs.isEmpty else { return 0 }
+            let icons = secs.reduce(0) { sum, s in
+                sum + ((container(for: s) as? NSStackView)?.arrangedSubviews.count ?? 0)
+            }
+            return CGFloat(icons) * (Self.iconSize + 8) + CGFloat(secs.count - 1) * 20
+        }
+
+        let switcherZone = config.zone(for: .switcher)
+        let avail: CGFloat
+        switch switcherZone {
+        case .center:
+            // Centered switcher: bounded by the wider flanking zone on each side,
+            // so it stays centered without hitting either. Usable half-span × 2.
+            let leftBlock = dockWidth(in: .left)
+            let rightBlock = dockWidth(in: .right)
+            let halfClear = screenW / 2 - max(leftBlock, rightBlock) - gap - pad
+            avail = max(0, halfClear) * 2
+        case .left:
+            avail = screenW - dockWidth(in: .center) - dockWidth(in: .right) - 2 * pad - 2 * gap
+        case .right:
+            avail = screenW - dockWidth(in: .center) - dockWidth(in: .left) - 2 * pad - 2 * gap
+        }
+        let perButton = WindowButton.totalWidth + switcherRow1.spacing
+        return max(1, Int((max(0, avail) + switcherRow1.spacing) / perButton))
+    }
+
+    private func dockStacks() -> [NSStackView] { [pinnedStack, runningStack, othersStack] }
+
+    /// Raise a specific window (task-switcher click).
+    func raiseWindow(_ info: WindowInfo) {
+        WindowControl.raise(windowNumber: info.windowNumber, pid: info.pid)
+    }
+
+    private func makeSeparator() -> NSView {
+        let box = NSBox()
+        box.boxType = .separator
+        box.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            box.widthAnchor.constraint(equalToConstant: 1),
+            box.heightAnchor.constraint(equalToConstant: 30),
+        ])
+        return box
+    }
+
+    // MARK: - Left-click
+
+    func activate(_ item: DockItem) {
+        switch item.kind {
+        case .app(_, let url):
+            if let pid = item.runningPID, let app = NSRunningApplication(processIdentifier: pid) {
+                app.activate()
+            } else {
+                let cfg = NSWorkspace.OpenConfiguration()
+                cfg.activates = true
+                NSWorkspace.shared.openApplication(at: url, configuration: cfg)
+            }
+        case .folder(let url):
+            NSWorkspace.shared.open(url)
+        case .trash:
+            NSWorkspace.shared.open(URL(fileURLWithPath: NSString("~/.Trash").expandingTildeInPath))
+        }
+    }
+
+    /// Trigger App Exposé for a running app's item.
+    func expose(_ item: DockItem) {
+        guard let pid = item.runningPID,
+              let app = NSRunningApplication(processIdentifier: pid) else { return }
+        app.unhide()
+        app.activate()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            CoreDockSendNotification("com.apple.expose.front.awake" as CFString, 0)
+        }
+    }
+
+    // MARK: - Context menu
+
+    func makeMenu(for item: DockItem) -> NSMenu {
+        let menu = NSMenu()
+        func add(_ title: String, _ selector: Selector) {
+            let mi = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = item
+            menu.addItem(mi)
+        }
+
+        switch item.kind {
+        case .app:
+            if item.isRunning {
+                add("Show All Windows", #selector(menuShowAll(_:)))
+                add("Hide", #selector(menuHide(_:)))
+                menu.addItem(.separator())
+                add("Show in Finder", #selector(menuShowInFinder(_:)))
+                menu.addItem(.separator())
+                add("Quit", #selector(menuQuit(_:)))
+            } else {
+                add("Open", #selector(menuOpen(_:)))
+                add("Show in Finder", #selector(menuShowInFinder(_:)))
+            }
+        case .folder:
+            add("Open", #selector(menuOpen(_:)))
+            add("Open in Finder", #selector(menuShowInFinder(_:)))
+        case .trash:
+            add("Open", #selector(menuOpen(_:)))
+            add("Empty Trash", #selector(menuEmptyTrash(_:)))
+        }
+        return menu
+    }
+
+    private func item(from sender: NSMenuItem) -> DockItem? {
+        sender.representedObject as? DockItem
+    }
+
+    @objc private func menuOpen(_ sender: NSMenuItem) {
+        if let item = item(from: sender) { activate(item) }
+    }
+    @objc private func menuShowAll(_ sender: NSMenuItem) {
+        if let item = item(from: sender) { expose(item) }
+    }
+    @objc private func menuHide(_ sender: NSMenuItem) {
+        if let pid = item(from: sender)?.runningPID {
+            NSRunningApplication(processIdentifier: pid)?.hide()
+        }
+    }
+    @objc private func menuQuit(_ sender: NSMenuItem) {
+        if let pid = item(from: sender)?.runningPID {
+            NSRunningApplication(processIdentifier: pid)?.terminate()
+        }
+    }
+    @objc private func menuShowInFinder(_ sender: NSMenuItem) {
+        guard let item = item(from: sender) else { return }
+        switch item.kind {
+        case .app(_, let url), .folder(let url):
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        case .trash:
+            NSWorkspace.shared.open(URL(fileURLWithPath: NSString("~/.Trash").expandingTildeInPath))
+        }
+    }
+    @objc private func menuEmptyTrash(_ sender: NSMenuItem) {
+        let script = NSAppleScript(source: "tell application \"Finder\" to empty the trash")
+        var err: NSDictionary?
+        script?.executeAndReturnError(&err)
+    }
+}
+
+/// One Dock icon: an image-only button plus a running-dot drawn beneath it.
+/// Hosts the per-item context menu via `self.menu`, so right-click / control-click
+/// / two-finger-tap all work automatically.
+final class DockIconView: NSView {
+
+    private static let badgeSize: CGFloat = 14
+
+    private let item: DockItem
+    private weak var panel: TaskbarPanel?
+    private let imageView = NSImageView()
+
+    /// The icon occupies the top `iconSize` square; the bottom 6pt holds the dot.
+    private var iconRect: NSRect {
+        let size = TaskbarPanel.iconSize
+        return NSRect(x: 0, y: bounds.height - size, width: size, height: size)
+    }
+
+    /// Exposé badge, top-right corner of the icon. Only meaningful when running.
+    private var badgeRect: NSRect {
+        let b = Self.badgeSize
+        let icon = iconRect
+        return NSRect(x: icon.maxX - b, y: icon.maxY - b, width: b, height: b)
+    }
+
+    init(item: DockItem, panel: TaskbarPanel) {
+        self.item = item
+        self.panel = panel
+        super.init(frame: .zero)
+
+        let size = TaskbarPanel.iconSize
+        imageView.image = item.icon
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        // Let mouse events fall through to this view so we can hit-test the badge.
+        imageView.refusesFirstResponder = true
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(imageView)
+
+        toolTip = item.label
+        translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: size),
+            heightAnchor.constraint(equalToConstant: size + 6),
+            imageView.topAnchor.constraint(equalTo: topAnchor),
+            imageView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            imageView.widthAnchor.constraint(equalToConstant: size),
+            imageView.heightAnchor.constraint(equalToConstant: size),
+        ])
+
+        self.menu = panel.makeMenu(for: item)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    // The image view would otherwise swallow the click; route everything through here.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        return bounds.contains(local) ? self : nil
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        // Click on the Exposé badge (running apps only) → App Exposé; else regular.
+        if item.isRunning, badgeRect.insetBy(dx: -3, dy: -3).contains(p) {
+            panel?.expose(item)
+        } else {
+            panel?.activate(item)
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard item.isRunning else { return }
+
+        // Running dot, centered along the bottom edge.
+        let d: CGFloat = 4
+        let dot = NSRect(x: (bounds.width - d) / 2, y: 0, width: d, height: d)
+        NSColor.labelColor.withAlphaComponent(0.65).setFill()
+        NSBezierPath(ovalIn: dot).fill()
+
+        // Exposé badge: a small rounded square with a grid glyph, top-right.
+        let badge = badgeRect
+        let bg = NSBezierPath(roundedRect: badge, xRadius: 3, yRadius: 3)
+        NSColor(white: 0.15, alpha: 0.45).setFill()
+        bg.fill()
+        drawExposeGlyph(in: badge.insetBy(dx: 4, dy: 4))
+    }
+
+    /// A 2×2 grid of small rects — the App Exposé motif.
+    private func drawExposeGlyph(in rect: NSRect) {
+        let gap: CGFloat = 1.2
+        let cellW = (rect.width - gap) / 2
+        let cellH = (rect.height - gap) / 2
+        NSColor.white.withAlphaComponent(0.7).setFill()
+        for col in 0..<2 {
+            for row in 0..<2 {
+                let cell = NSRect(
+                    x: rect.minX + CGFloat(col) * (cellW + gap),
+                    y: rect.minY + CGFloat(row) * (cellH + gap),
+                    width: cellW, height: cellH)
+                NSBezierPath(roundedRect: cell, xRadius: 0.6, yRadius: 0.6).fill()
+            }
+        }
+    }
+}
+
+/// A single Win95-style task-switcher button: raised bevel, small icon + title.
+/// Click raises that specific window.
+final class WindowButton: NSView {
+
+    private static let height: CGFloat = 24
+    private static let fixedWidth: CGFloat = 140
+    /// Per-button width used by the panel to compute how many fit per row.
+    static var totalWidth: CGFloat { fixedWidth }
+
+    private let info: WindowInfo
+    private weak var panel: TaskbarPanel?
+    private var pressed = false
+
+    init(info: WindowInfo, panel: TaskbarPanel) {
+        self.info = info
+        self.panel = panel
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+
+        let iconView = NSImageView(image: info.icon)
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+
+        let label = NSTextField(labelWithString: info.displayTitle)
+        label.font = .systemFont(ofSize: 11)
+        label.textColor = .labelColor
+        label.lineBreakMode = .byTruncatingTail
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        addSubview(iconView)
+        addSubview(label)
+        toolTip = info.displayTitle
+
+        // Fixed-width box so every task button is identical (Win95 style); the
+        // label truncates within it rather than letting the stack size buttons
+        // unevenly.
+        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        // Preferred fixed width (breakable) so non-expanding rows stay uniform, but
+        // a `.fillEqually` row can stretch buttons wider to fill spare space.
+        let preferredW = widthAnchor.constraint(equalToConstant: Self.fixedWidth)
+        preferredW.priority = .defaultLow
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: Self.height),
+            preferredW,
+            widthAnchor.constraint(greaterThanOrEqualToConstant: Self.fixedWidth),
+            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 5),
+            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 16),
+            iconView.heightAnchor.constraint(equalToConstant: 16),
+            label.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 4),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func mouseDown(with event: NSEvent) {
+        pressed = true
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        pressed = false
+        needsDisplay = true
+        if bounds.contains(convert(event.locationInWindow, from: nil)) {
+            panel?.raiseWindow(info)
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let r = bounds.insetBy(dx: 0.5, dy: 0.5)
+        // Win95 raised-button bevel: light top-left, dark bottom-right.
+        (pressed ? NSColor(white: 0.78, alpha: 0.9) : NSColor(white: 0.86, alpha: 0.9)).setFill()
+        NSBezierPath(rect: r).fill()
+
+        let light = NSColor.white.withAlphaComponent(0.9)
+        let dark = NSColor(white: 0.45, alpha: 0.9)
+        let topLeft = pressed ? dark : light
+        let bottomRight = pressed ? light : dark
+
+        topLeft.setStroke()
+        let tl = NSBezierPath()
+        tl.move(to: NSPoint(x: r.minX, y: r.minY)); tl.line(to: NSPoint(x: r.minX, y: r.maxY))
+        tl.line(to: NSPoint(x: r.maxX, y: r.maxY)); tl.lineWidth = 1; tl.stroke()
+
+        bottomRight.setStroke()
+        let br = NSBezierPath()
+        br.move(to: NSPoint(x: r.minX, y: r.minY)); br.line(to: NSPoint(x: r.maxX, y: r.minY))
+        br.line(to: NSPoint(x: r.maxX, y: r.maxY)); br.lineWidth = 1; br.stroke()
+    }
+}
