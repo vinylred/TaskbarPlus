@@ -28,28 +28,40 @@ enum WindowControl {
         app?.unhide()
         app?.activate()
 
-        guard AXIsProcessTrusted() else { return }
+        guard let window = axWindow(windowNumber: windowNumber, pid: pid) else { return }
+        var minimized: CFTypeRef?
+        if AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute as CFString, &minimized) == .success,
+           (minimized as? Bool) == true {
+            AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        }
+        AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+        AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    }
+
+    /// Close ONLY the given window (not the whole app) by pressing its AX close
+    /// button. No-op if Accessibility isn't granted or the window can't be matched.
+    static func close(windowNumber: Int, pid: pid_t) {
+        guard let window = axWindow(windowNumber: windowNumber, pid: pid) else { return }
+        var btn: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXCloseButtonAttribute as CFString, &btn) == .success,
+              let closeButton = btn, CFGetTypeID(closeButton) == AXUIElementGetTypeID() else { return }
+        AXUIElementPerformAction(closeButton as! AXUIElement, kAXPressAction as CFString)
+    }
+
+    /// The AX window whose CGWindowID matches `windowNumber`, or nil.
+    private static func axWindow(windowNumber: Int, pid: pid_t) -> AXUIElement? {
+        guard AXIsProcessTrusted() else { return nil }
         let appElement = AXUIElementCreateApplication(pid)
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
-              let windows = value as? [AXUIElement] else { return }
-
-        // Match the CGWindowID to the AX window via the private _AXUIElementGetWindow.
+              let windows = value as? [AXUIElement] else { return nil }
         for window in windows {
             var wid: CGWindowID = 0
             if _AXUIElementGetWindow(window, &wid) == .success, Int(wid) == windowNumber {
-                var minimized: CFTypeRef?
-                if AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute as CFString, &minimized) == .success,
-                   (minimized as? Bool) == true {
-                    AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
-                }
-                AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
-                AXUIElementPerformAction(window, kAXRaiseAction as CFString)
-                return
+                return window
             }
         }
-        // No match (e.g. AX window list didn't include it): app activation above
-        // is the best we can do.
+        return nil
     }
 }
 

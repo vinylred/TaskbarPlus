@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panels: [String: TaskbarPanel] = [:]
     private var latestItems: [DockItem] = []
     private var latestWindows: [WindowInfo] = []
+    private var latestDesktop = ""
 
     private func key(_ origin: CGPoint) -> String { "\(origin.x),\(origin.y)" }
 
@@ -31,6 +32,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         service.onWindowsChange = { [weak self] windows in
             self?.latestWindows = windows
             self?.distributeWindows()
+        }
+        // Current desktop name shown under the Apps button (same on all bars).
+        service.onDesktopChange = { [weak self] name in
+            self?.latestDesktop = name
+            self?.panels.values.forEach { $0.updateDesktop(name) }
         }
 
         // Recreate panels when displays change (plug/unplug, resolution).
@@ -114,7 +120,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // Create panels for newly-targeted screens.
         for screen in wanted where panels[key(screen.frame.origin)] == nil {
-            panels[key(screen.frame.origin)] = TaskbarPanel(screen: screen, config: config)
+            let panel = TaskbarPanel(screen: screen, config: config)
+            panel.onCloseRequested = { [weak self] in self?.service.refreshNow() }
+            if !latestDesktop.isEmpty { panel.updateDesktop(latestDesktop) }
+            panels[key(screen.frame.origin)] = panel
         }
     }
 

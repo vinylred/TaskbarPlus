@@ -22,6 +22,7 @@ final class TaskbarPanel: NSPanel {
 
     // Per-section content containers (filled by update*, then placed into a zone).
     private let launcherStack = NSStackView()
+    private let launcherButton = LauncherButton()
     private let pinnedStack = NSStackView()
     private let runningStack = NSStackView()
     private let othersStack = NSStackView()
@@ -75,7 +76,7 @@ final class TaskbarPanel: NSPanel {
             s.alignment = .centerY
             s.spacing = 8
         }
-        launcherStack.addArrangedSubview(LauncherButton())
+        launcherStack.addArrangedSubview(launcherButton)
 
         // Switcher: vertical stack of two horizontal rows.
         for row in [switcherRow1, switcherRow2] {
@@ -140,6 +141,11 @@ final class TaskbarPanel: NSPanel {
 
     private var lastWindows: [WindowInfo] = []
     private var dockSignature = ""
+
+    /// Update the desktop-name label under the Apps button.
+    func updateDesktop(_ name: String) {
+        launcherButton.setDesktop(name)
+    }
 
     func update(items: [DockItem]) {
         // Skip the (relatively expensive) view rebuild when nothing changed — this
@@ -309,37 +315,45 @@ final class TaskbarPanel: NSPanel {
         for v in switcherRow1.arrangedSubviews { switcherRow1.removeView(v) }
         for v in switcherRow2.arrangedSubviews { switcherRow2.removeView(v) }
 
-        let perRow = max(1, switcherPerRowCapacity())
+        let avail = switcherAvailableWidth()
+        let spacing = switcherRow1.spacing
 
-        // Split across two rows; cap to what fits so it never overflows the screen.
-        let capacity = perRow * 2
+        // How many buttons fit in one row at the minimum width — that's the most a
+        // single row can hold; two rows hold double. Fit ALL windows by shrinking
+        // buttons; only drop windows if even min-width can't hold them across 2 rows.
+        let maxPerRow = max(1, Int((avail + spacing) / (WindowButton.minWidth + spacing)))
+        let capacity = maxPerRow * 2
         let shown = Array(windows.prefix(capacity))
-        let topCount = min(perRow, shown.count)   // fill the top row first
+
+        // Buttons per row to balance the two rows, then the width that exactly fills
+        // the available row width (clamped to [min, preferred]).
+        let perRow = max(1, Int(ceil(Double(shown.count) / 2.0)))
+        let rawWidth = (avail - CGFloat(perRow - 1) * spacing) / CGFloat(perRow)
+        let buttonWidth = max(WindowButton.minWidth, min(WindowButton.preferredWidth, rawWidth))
+
+        let topCount = min(perRow, shown.count)
         for (i, w) in shown.enumerated() {
             let row = i < topCount ? switcherRow1 : switcherRow2
-            row.addArrangedSubview(WindowButton(info: w, panel: self))
+            row.addArrangedSubview(WindowButton(info: w, panel: self, width: buttonWidth))
         }
-        // Hide an empty second row so a single row stays vertically centered.
         switcherRow2.isHidden = switcherRow2.arrangedSubviews.isEmpty
         reassembleZones()
 
         if ProcessInfo.processInfo.environment["TBP_DEBUG"] != nil {
-            contentView?.layoutSubtreeIfNeeded()
-            NSLog("switcher: panelW=\(frame.width) perRow=\(perRow) shown=\(shown.count)/\(windows.count) force=\(force)")
+            NSLog("switcher: panelW=\(frame.width) perRow=\(perRow) width=\(Int(buttonWidth)) shown=\(shown.count)/\(windows.count)")
         }
     }
 
-    /// Max Win95 buttons that fit per row, given the switcher's zone and the space
-    /// the other (Dock) sections consume. Guarantees the strip never overflows the
-    /// screen, wherever the switcher is placed.
-    private func switcherPerRowCapacity() -> Int {
+    /// Width available to ONE switcher row, given the switcher's zone and the space
+    /// the Dock sections consume. Buttons are sized to fill this so the strip never
+    /// overflows the screen, wherever the switcher is placed.
+    private func switcherAvailableWidth() -> CGFloat {
         let screenW = frame.width > 0 ? frame.width : (NSScreen.screens.first?.frame.width ?? 1512)
         let pad = Self.horizontalPadding
         let gap: CGFloat = 16
 
-        // Estimated width of the Dock sections (pinned/running/others) that sit in
-        // each zone, from icon COUNT (timing-independent, unlike fittingSize which
-        // is 0 before the first layout pass).
+        // Estimated width of the Dock sections (pinned/running/others) per zone, from
+        // icon COUNT (timing-independent, unlike fittingSize before first layout).
         func dockWidth(in zone: Zone) -> CGFloat {
             let secs: [Section] = [.pinned, .running, .others].filter {
                 config.zone(for: $0) == zone && !isEmpty($0)
@@ -351,23 +365,15 @@ final class TaskbarPanel: NSPanel {
             return CGFloat(icons) * (Self.iconSize + 8) + CGFloat(secs.count - 1) * 20
         }
 
-        let switcherZone = config.zone(for: .switcher)
-        let avail: CGFloat
-        switch switcherZone {
+        switch config.zone(for: .switcher) {
         case .center:
-            // Centered switcher: bounded by the wider flanking zone on each side,
-            // so it stays centered without hitting either. Usable half-span × 2.
-            let leftBlock = dockWidth(in: .left)
-            let rightBlock = dockWidth(in: .right)
-            let halfClear = screenW / 2 - max(leftBlock, rightBlock) - gap - pad
-            avail = max(0, halfClear) * 2
+            let halfClear = screenW / 2 - max(dockWidth(in: .left), dockWidth(in: .right)) - gap - pad
+            return max(WindowButton.minWidth, halfClear * 2)
         case .left:
-            avail = screenW - dockWidth(in: .center) - dockWidth(in: .right) - 2 * pad - 2 * gap
+            return max(WindowButton.minWidth, screenW - dockWidth(in: .center) - dockWidth(in: .right) - 2 * pad - 2 * gap)
         case .right:
-            avail = screenW - dockWidth(in: .center) - dockWidth(in: .left) - 2 * pad - 2 * gap
+            return max(WindowButton.minWidth, screenW - dockWidth(in: .center) - dockWidth(in: .left) - 2 * pad - 2 * gap)
         }
-        let perButton = WindowButton.totalWidth + switcherRow1.spacing
-        return max(1, Int((max(0, avail) + switcherRow1.spacing) / perButton))
     }
 
     private func dockStacks() -> [NSStackView] { [pinnedStack, runningStack, othersStack] }
@@ -507,7 +513,7 @@ final class TaskbarPanel: NSPanel {
         menu.addItem(.separator())
         add("Show in Finder", #selector(winShowInFinder(_:)))
         menu.addItem(.separator())
-        add("Quit", #selector(winQuit(_:)))
+        add("Close", #selector(winClose(_:)))
         return menu
     }
 
@@ -531,11 +537,18 @@ final class TaskbarPanel: NSPanel {
             NSRunningApplication(processIdentifier: pid)?.hide()
         }
     }
-    @objc private func winQuit(_ sender: NSMenuItem) {
-        if let pid = win(from: sender)?.pid {
-            NSRunningApplication(processIdentifier: pid)?.terminate()
+    @objc private func winClose(_ sender: NSMenuItem) {
+        if let w = win(from: sender) {
+            WindowControl.close(windowNumber: w.windowNumber, pid: w.pid)
+            // Update the taskbar immediately rather than waiting for the poll.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                self?.onCloseRequested?()
+            }
         }
     }
+
+    /// Set by the controller to force an immediate window-list refresh.
+    var onCloseRequested: (() -> Void)?
     @objc private func winShowInFinder(_ sender: NSMenuItem) {
         if let pid = win(from: sender)?.pid,
            let url = NSRunningApplication(processIdentifier: pid)?.bundleURL {
@@ -654,15 +667,15 @@ final class DockIconView: NSView {
 final class WindowButton: NSView {
 
     private static let height: CGFloat = 24
-    private static let fixedWidth: CGFloat = 140
-    /// Per-button width used by the panel to compute how many fit per row.
-    static var totalWidth: CGFloat { fixedWidth }
+    static let preferredWidth: CGFloat = 140
+    /// Buttons shrink down to this (icon + a few chars) before any window is dropped.
+    static let minWidth: CGFloat = 44
 
     private let info: WindowInfo
     private weak var panel: TaskbarPanel?
     private var pressed = false
 
-    init(info: WindowInfo, panel: TaskbarPanel) {
+    init(info: WindowInfo, panel: TaskbarPanel, width: CGFloat) {
         self.info = info
         self.panel = panel
         super.init(frame: .zero)
@@ -682,21 +695,15 @@ final class WindowButton: NSView {
 
         addSubview(iconView)
         addSubview(label)
-        toolTip = info.displayTitle
         self.menu = panel.makeWindowMenu(for: info)
 
-        // Fixed-width box so every task button is identical (Win95 style); the
-        // label truncates within it rather than letting the stack size buttons
-        // unevenly.
+        // Width is decided by the panel (shrinks to fit all windows before any are
+        // dropped). The label truncates within whatever width we get.
         label.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        // Preferred fixed width (breakable) so non-expanding rows stay uniform, but
-        // a `.fillEqually` row can stretch buttons wider to fill spare space.
-        let preferredW = widthAnchor.constraint(equalToConstant: Self.fixedWidth)
-        preferredW.priority = .defaultLow
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: Self.height),
-            preferredW,
-            widthAnchor.constraint(greaterThanOrEqualToConstant: Self.fixedWidth),
+            widthAnchor.constraint(equalToConstant: width),
             iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 5),
             iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
             iconView.widthAnchor.constraint(equalToConstant: 16),
@@ -708,6 +715,32 @@ final class WindowButton: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    // The panel is a non-key, non-activating window, so AppKit's built-in .toolTip
+    // never fires. Use an explicit tracking area + a custom floating tooltip instead.
+    private var hoverTimer: Timer?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach { removeTrackingArea($0) }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseEnteredAndExited, .activeAlways],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hoverTimer?.invalidate()
+        hoverTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            TooltipWindow.shared.show(self.info.displayTitle, below: self)
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hoverTimer?.invalidate(); hoverTimer = nil
+        TooltipWindow.shared.hide()
+    }
 
     private func setPressed(_ v: Bool) {
         guard pressed != v else { return }
@@ -729,6 +762,7 @@ final class WindowButton: NSView {
         // Clear the pressed look BEFORE raising the window — raising changes focus
         // and can interrupt the run loop, which previously left the button stuck.
         setPressed(false)
+        hoverTimer?.invalidate(); TooltipWindow.shared.hide()
         if inside { panel?.raiseWindow(info) }
     }
 
@@ -781,6 +815,7 @@ final class LauncherButton: NSView {
 
     private let builder = AppMenuBuilder()
     private let button = NSButton()
+    private let desktopLabel = NSTextField(labelWithString: "")
 
     init() {
         super.init(frame: .zero)
@@ -799,16 +834,31 @@ final class LauncherButton: NSView {
         button.translatesAutoresizingMaskIntoConstraints = false
         addSubview(button)
 
+        desktopLabel.font = .systemFont(ofSize: 9)
+        desktopLabel.textColor = .secondaryLabelColor
+        desktopLabel.alignment = .center
+        desktopLabel.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(desktopLabel)
+
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: TaskbarPanel.iconSize),
-            button.centerYAnchor.constraint(equalTo: centerYAnchor),
+            // Apps button on top, desktop label centered beneath it.
+            button.topAnchor.constraint(equalTo: topAnchor, constant: 4),
             button.leadingAnchor.constraint(equalTo: leadingAnchor),
             button.trailingAnchor.constraint(equalTo: trailingAnchor),
-            button.heightAnchor.constraint(equalToConstant: 26),
+            button.heightAnchor.constraint(equalToConstant: 24),
+            desktopLabel.topAnchor.constraint(equalTo: button.bottomAnchor, constant: 1),
+            desktopLabel.leadingAnchor.constraint(equalTo: leadingAnchor),
+            desktopLabel.trailingAnchor.constraint(equalTo: trailingAnchor),
         ])
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    /// Update the desktop-name label (e.g. "Desktop 2").
+    func setDesktop(_ name: String) {
+        desktopLabel.stringValue = name
+    }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -821,5 +871,70 @@ final class LauncherButton: NSView {
         // Pop up just above the button (the bar sits at the screen's bottom edge).
         let origin = NSPoint(x: 0, y: bounds.height + 4)
         menu.popUp(positioning: nil, at: origin, in: self)
+    }
+}
+
+/// A small floating tooltip used because the bar's non-key panel can't trigger
+/// AppKit's built-in .toolTip. Single shared instance, reused.
+final class TooltipWindow {
+    static let shared = TooltipWindow()
+
+    private let panel: NSPanel
+    private let label = NSTextField(labelWithString: "")
+
+    private init() {
+        panel = NSPanel(contentRect: .zero,
+                        styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: true)
+        panel.level = .popUpMenu
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = true
+        panel.ignoresMouseEvents = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        panel.isReleasedWhenClosed = false
+
+        let bg = NSVisualEffectView()
+        bg.material = .toolTip
+        bg.blendingMode = .behindWindow
+        bg.state = .active
+        bg.wantsLayer = true
+        bg.layer?.cornerRadius = 5
+        bg.layer?.masksToBounds = true
+        bg.translatesAutoresizingMaskIntoConstraints = false
+        panel.contentView = bg
+
+        label.font = .systemFont(ofSize: 11)
+        label.textColor = .labelColor
+        label.maximumNumberOfLines = 1
+        label.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 7),
+            label.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -7),
+            label.topAnchor.constraint(equalTo: bg.topAnchor, constant: 4),
+            label.bottomAnchor.constraint(equalTo: bg.bottomAnchor, constant: -4),
+        ])
+    }
+
+    /// Show `text` centered above the given view (the bar sits at the screen bottom).
+    func show(_ text: String, below view: NSView) {
+        guard let window = view.window else { return }
+        label.stringValue = text
+        panel.appearance = window.appearance
+        panel.layoutIfNeeded()
+        let size = panel.contentView!.fittingSize
+
+        // Position centered horizontally over the button, just above the bar.
+        let inWindow = view.convert(view.bounds, to: nil)
+        let onScreen = window.convertToScreen(inWindow)
+        let x = onScreen.midX - size.width / 2
+        let y = onScreen.maxY + 4
+        panel.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
+        panel.orderFront(nil)
+    }
+
+    func hide() {
+        panel.orderOut(nil)
     }
 }

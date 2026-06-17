@@ -16,6 +16,11 @@ final class SpaceWindowService {
     /// in stable left-to-right order (for the task switcher).
     var onWindowsChange: (([WindowInfo]) -> Void)?
 
+    /// Called on the main thread with the current desktop label ("Desktop N") when
+    /// it changes.
+    var onDesktopChange: ((String) -> Void)?
+    private var lastDesktopName = ""
+
     /// Distinct app count from the last accepted window scan, used to detect the
     /// transient collapse to a single app during App Exposé / Mission Control.
     private var lastAppCount = 0
@@ -76,15 +81,20 @@ final class SpaceWindowService {
         }
     }
 
-    private func refresh() {
+    /// Force an immediate, authoritative refresh that skips the anti-flicker
+    /// hysteresis — used right after WE close a window, so the taskbar updates at
+    /// once instead of waiting for the poll + miss-threshold + collapse-skip.
+    func refreshNow() { refresh(immediate: true) }
+
+    private func refresh(immediate: Bool = false) {
         let windows = currentSpaceWindows()
 
         // App Exposé / Mission Control transiently collapses the on-screen window
         // set to just the focused app. If we previously saw several apps and now
         // see only one, treat it as that transient and skip — but only briefly, so
         // a *genuine* collapse (user really closed the other apps) still updates
-        // once it persists across a couple of refreshes.
-        if let ws = windows {
+        // once it persists across a couple of refreshes. (Skipped when immediate.)
+        if !immediate, let ws = windows {
             let appCount = Set(ws.map { $0.pid }).count
             if appCount <= 1 && lastAppCount > 1 && collapseSkips < 6 {
                 collapseSkips += 1
@@ -92,13 +102,16 @@ final class SpaceWindowService {
             }
             collapseSkips = 0
             lastAppCount = appCount
+        } else if let ws = windows {
+            lastAppCount = Set(ws.map { $0.pid }).count
+            collapseSkips = 0
         }
 
         let detected = windows.map { Array(Set($0.map { $0.pid })) }
         let pids = detected ?? fallbackPIDs()
         let apps = resolveApps(orderStable(pids))
 
-        let orderedWindows = orderStableWindows(windows ?? [])
+        let orderedWindows = orderStableWindows(windows ?? [], immediate: immediate)
 
         if ProcessInfo.processInfo.environment["TBP_DEBUG"] != nil {
             let mode = detected == nil ? "FALLBACK(all-apps)" : "current-space"
@@ -106,6 +119,12 @@ final class SpaceWindowService {
         }
         onChange?(apps)
         onWindowsChange?(orderedWindows)
+
+        let desktop = currentDesktopName()
+        if desktop != lastDesktopName {
+            lastDesktopName = desktop
+            onDesktopChange?(desktop)
+        }
     }
 
     // MARK: - Current-Space detection (private APIs)
@@ -190,6 +209,23 @@ final class SpaceWindowService {
         return nil
     }
 
+    /// Human label for the current Space, e.g. "Desktop 2" — the 1-based index of
+    /// the active space within the primary display's ordered Spaces list. Fullscreen
+    /// spaces count too (matching Mission Control's numbering). Falls back to "Desktop".
+    func currentDesktopName() -> String {
+        guard let raw = CGSCopyManagedDisplaySpaces(cid),
+              let displays = (raw as NSArray) as? [[String: Any]],
+              // Use the display that has the menu bar (primary) when there are several.
+              let display = displays.first else { return "Desktop" }
+        guard let spaces = display["Spaces"] as? [[String: Any]],
+              let current = display["Current Space"] as? [String: Any],
+              let currentID = spaceID(from: current) else { return "Desktop" }
+        if let idx = spaces.firstIndex(where: { spaceID(from: $0) == currentID }) {
+            return "Desktop \(idx + 1)"
+        }
+        return "Desktop"
+    }
+
     /// Space ids that the given window numbers belong to.
     private func spaceIDs(forWindowNumbers numbers: [Int]) -> Set<UInt64> {
         let cfNumbers = numbers.map { NSNumber(value: $0) } as CFArray
@@ -224,8 +260,9 @@ final class SpaceWindowService {
     /// transient blip (a window flickering in/out of the Space for one refresh)
     /// doesn't add/remove a switcher button. New windows appear immediately;
     /// a window is only dropped after it's been absent for `missThreshold` refreshes.
-    private func orderStableWindows(_ windows: [WindowInfo]) -> [WindowInfo] {
-        let missThreshold = 2
+    private func orderStableWindows(_ windows: [WindowInfo], immediate: Bool = false) -> [WindowInfo] {
+        // immediate → drop absent windows at once (no grace) for an authoritative update.
+        let missThreshold = immediate ? 1 : 2
         let byNum = Dictionary(windows.map { ($0.windowNumber, $0) }, uniquingKeysWith: { a, _ in a })
 
         // Refresh cached info for present windows; reset their miss count.
