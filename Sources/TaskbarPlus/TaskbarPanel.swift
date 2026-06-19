@@ -7,13 +7,25 @@ import CSkyLight
 /// Layout mirrors the real Dock: [pinned] | [running-only] | [folders + Trash],
 /// with separators only between non-empty sections and a running-dot under each
 /// running app. Each icon hosts a right-click context menu.
+/// Which portion of the screen width a panel occupies. `.full` is the normal
+/// single bar; `.left`/`.right` are the two narrow split-mode panels with a clear
+/// center gap between them for the real Dock.
+enum SplitSide { case full, left, right }
+
 final class TaskbarPanel: NSPanel {
 
     static let iconSize: CGFloat = 40
     private static let barHeight: CGFloat = 60
     private static let horizontalPadding: CGFloat = 14
+    /// Fallback center gap (split mode) when the Dock width can't be estimated.
+    private static let centerGapFraction: CGFloat = 0.40
 
     private let config: LayoutConfig
+    private let side: SplitSide
+
+    /// Split-mode resting level (Dock floats on top) and the raised level (above Dock).
+    private static let belowDock = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) - 1)
+    private static let aboveDock = NSWindow.Level.statusBar
 
     // Three horizontal zones the sections are distributed into.
     private let leftZone = NSStackView()
@@ -38,9 +50,10 @@ final class TaskbarPanel: NSPanel {
     /// it survives display reconfiguration.
     private let targetFrameOrigin: CGPoint
 
-    init(screen: NSScreen, config: LayoutConfig) {
+    init(screen: NSScreen, config: LayoutConfig, side: SplitSide = .full) {
         self.targetFrameOrigin = screen.frame.origin
         self.config = config
+        self.side = side
         super.init(
             contentRect: .zero,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -49,7 +62,10 @@ final class TaskbarPanel: NSPanel {
         )
 
         isFloatingPanel = true
-        level = .statusBar
+        // Normal bar floats above everything (statusBar = 25 > dock = 20). Split mode
+        // rests JUST BELOW the Dock (dock − 1) so the Dock floats on top in the center;
+        // hovering the bar raises it above the Dock (see mouseEntered/Exited).
+        level = config.splitMode ? Self.belowDock : .statusBar
         collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
         backgroundColor = .clear
         isOpaque = false
@@ -112,31 +128,63 @@ final class TaskbarPanel: NSPanel {
                 z.wantsLayer = true
                 z.layer?.borderColor = borderColors[i].cgColor
                 z.layer?.borderWidth = 2
+                z.layer?.backgroundColor = borderColors[i].withAlphaComponent(0.18).cgColor
             }
         }
         if debugBorders {
             switcherStack.wantsLayer = true
             switcherStack.layer?.borderColor = NSColor.systemYellow.cgColor
             switcherStack.layer?.borderWidth = 2
+            switcherStack.layer?.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.25).cgColor
         }
-        // Zone edges pinned to the screen are REQUIRED and authoritative — the right
-        // zone (Trash) always sits flush right. The no-overlap guards are slightly
-        // lower priority so they can't override the edge pins and shove a zone
-        // off-screen (which made the right zone vanish); the centered switcher's
-        // width is capped separately so it stays clear without needing the guard.
-        let leftPin = leftZone.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: Self.horizontalPadding)
-        let rightPin = rightZone.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -Self.horizontalPadding)
-        leftPin.priority = .required
-        rightPin.priority = .required
-        let guardL = centerZone.leadingAnchor.constraint(greaterThanOrEqualTo: leftZone.trailingAnchor, constant: 16)
-        let guardR = rightZone.leadingAnchor.constraint(greaterThanOrEqualTo: centerZone.trailingAnchor, constant: 16)
-        guardL.priority = .defaultHigh
-        guardR.priority = .defaultHigh
-        NSLayoutConstraint.activate([
-            leftPin, rightPin,
-            centerZone.centerXAnchor.constraint(equalTo: blur.centerXAnchor),
-            guardL, guardR,
-        ])
+
+        if config.splitMode {
+            // Split mode: launcher pinned LEFT, switcher (right zone) pinned RIGHT and
+            // grows leftward. No center zone / no-overlap guards — those were pushing
+            // the right zone off-screen. The launcher is tiny, so there's no overlap.
+            leftZone.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: Self.horizontalPadding).isActive = true
+            let rightPin = rightZone.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -Self.horizontalPadding)
+            rightPin.priority = .required
+            // Hard floor: the right zone can't cross into the launcher (so its content
+            // is forced to shrink/cap rather than overflow either edge).
+            let floor = rightZone.leadingAnchor.constraint(greaterThanOrEqualTo: leftZone.trailingAnchor, constant: 16)
+            floor.priority = .required
+            NSLayoutConstraint.activate([rightPin, floor])
+            reposition()
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(reposition),
+                name: NSApplication.didChangeScreenParametersNotification, object: nil)
+            orderFront(nil)
+            return
+        }
+
+        switch side {
+        case .full:
+            // Full bar: three zones (left edge / centered / right edge) with
+            // no-overlap guards. Edge pins required; guards lower so they can't shove
+            // a zone off-screen.
+            let leftPin = leftZone.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: Self.horizontalPadding)
+            let rightPin = rightZone.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -Self.horizontalPadding)
+            leftPin.priority = .required
+            rightPin.priority = .required
+            let guardL = centerZone.leadingAnchor.constraint(greaterThanOrEqualTo: leftZone.trailingAnchor, constant: 16)
+            let guardR = rightZone.leadingAnchor.constraint(greaterThanOrEqualTo: centerZone.trailingAnchor, constant: 16)
+            guardL.priority = .defaultHigh
+            guardR.priority = .defaultHigh
+            NSLayoutConstraint.activate([
+                leftPin, rightPin,
+                centerZone.centerXAnchor.constraint(equalTo: blur.centerXAnchor),
+                guardL, guardR,
+            ])
+        case .left:
+            // Split-left panel hosts only the launcher (left zone), pinned to the
+            // left edge. Center/right zones are unused (no constraints → zero size).
+            leftZone.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: Self.horizontalPadding).isActive = true
+        case .right:
+            // Split-right panel hosts only the switcher (right zone), pinned to the
+            // right edge so it can't run off-panel.
+            rightZone.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -Self.horizontalPadding).isActive = true
+        }
 
         reposition()
         NotificationCenter.default.addObserver(
@@ -161,9 +209,36 @@ final class TaskbarPanel: NSPanel {
             ?? NSScreen.screens.first(where: { $0.frame.origin == .zero })
             ?? NSScreen.screens.first
         guard let screen else { return }
-        let vf = screen.visibleFrame
-        let frame = NSRect(x: vf.minX, y: vf.minY, width: vf.width, height: Self.barHeight)
-        setFrame(frame, display: true)
+        let h = Self.barHeight
+        // Normal mode: sit in the visible area (above the Dock). Split mode: sit at the
+        // screen's true bottom edge, level with the Dock — the Dock floats on top in the
+        // center (bar is below the Dock's window level), launcher/switcher show at edges.
+        let area = config.splitMode ? screen.frame : screen.visibleFrame
+        setFrame(NSRect(x: area.minX, y: area.minY, width: area.width, height: h), display: true)
+        installHoverTracking()
+    }
+
+    private var hoverTracking: NSTrackingArea?
+
+    /// In split mode, track the mouse over the bar so we can raise it above the Dock
+    /// on hover. The Dock-covered center won't deliver enter events (the Dock gets
+    /// them) — only the visible launcher/switcher edges trigger it, which is intended.
+    private func installHoverTracking() {
+        guard config.splitMode, let view = contentView else { return }
+        if let t = hoverTracking { view.removeTrackingArea(t) }
+        let t = NSTrackingArea(rect: view.bounds,
+                               options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                               owner: self, userInfo: nil)
+        view.addTrackingArea(t)
+        hoverTracking = t
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        if config.splitMode { level = Self.aboveDock }   // rise above the Dock
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        if config.splitMode { level = Self.belowDock }   // settle back under the Dock
     }
 
     // MARK: - Update
@@ -173,6 +248,8 @@ final class TaskbarPanel: NSPanel {
     private var grouped = false
     /// Number of desktops to segment into (grouped mode). Provided by the controller.
     var desktopCount: () -> Int = { 0 }
+    /// 1-based index of the active desktop (grouped mode places it rightmost).
+    var activeDesktop: () -> Int = { 0 }
 
     /// Update the desktop-name label under the Apps button.
     func updateDesktop(_ name: String) {
@@ -262,14 +339,28 @@ final class TaskbarPanel: NSPanel {
         // Stable section order within any zone.
         let order: [Section] = [.launcher, .pinned, .running, .others, .switcher]
         for zoneKind in [Zone.left, .center, .right] {
+            // This panel only mounts sections whose effective zone matches its side
+            // (left panel → left zone, right panel → right zone, full → all zones).
+            guard sideAllows(zoneKind) else { continue }
             let stack = zoneStack(zoneKind)
-            let members = order.filter { config.zone(for: $0) == zoneKind && !isEmpty($0) }
+            let members = order.filter {
+                config.sectionIsVisible($0) && config.effectiveZone(for: $0) == zoneKind && !isEmpty($0)
+            }
             for (i, section) in members.enumerated() {
                 if i > 0 { stack.addArrangedSubview(makeSeparator()) }
                 stack.addArrangedSubview(container(for: section))
             }
         }
         applySwitcherExpand()
+    }
+
+    /// Whether this panel's side renders content for the given zone.
+    private func sideAllows(_ zone: Zone) -> Bool {
+        switch side {
+        case .full:  return true
+        case .left:  return zone == .left
+        case .right: return zone == .right
+        }
     }
 
     private var switcherExpandConstraints: [NSLayoutConstraint] = []
@@ -283,7 +374,8 @@ final class TaskbarPanel: NSPanel {
         switcherExpandConstraints = []
 
         let expand = config.expand(for: .switcher)
-        let align = config.align(for: .switcher)
+        // Split mode pins the switcher to the right, so its content right-aligns too.
+        let align = config.splitMode ? .right : config.align(for: .switcher)
 
         switcherRow1.distribution = .fill
         switcherRow2.distribution = .fill
@@ -301,7 +393,9 @@ final class TaskbarPanel: NSPanel {
         // (leftZone→left edge, centerZone→centerX, rightZone→right edge, with
         // no-overlap guards) already position it correctly and robustly. This avoids
         // the fragile edge-pinning that kept mispositioning the right zone.
-        let needsArea = (expand != nil) && !isEmpty(.switcher)
+        // In split mode the switcher owns its whole panel and is pinned right by the
+        // zone constraints, so the expand pull-out is unnecessary.
+        let needsArea = (expand != nil) && !isEmpty(.switcher) && !config.splitMode
         guard needsArea, let blur = contentView else { return }
 
         (switcherStack.superview as? NSStackView)?.removeView(switcherStack)
@@ -360,7 +454,10 @@ final class TaskbarPanel: NSPanel {
     /// is unchanged (unless `force`, e.g. the Dock width changed so capacity must
     /// be recomputed).
     private func rebuildSwitcher(_ windows: [WindowInfo], force: Bool) {
-        let signature = "\(grouped)|" + windows.map { "\($0.windowNumber):\($0.displayTitle):\($0.desktopIndex)" }.joined(separator: "|")
+        // Include the active desktop so grouped mode re-orders (active box rightmost)
+        // when the Space changes even if the window set is identical.
+        let activeKey = grouped ? "\(activeDesktop())" : ""
+        let signature = "\(grouped)|\(activeKey)|" + windows.map { "\($0.windowNumber):\($0.displayTitle):\($0.desktopIndex)" }.joined(separator: "|")
         if !force, signature == switcherSignature { return }
         switcherSignature = signature
 
@@ -426,7 +523,7 @@ final class TaskbarPanel: NSPanel {
         }
 
         if ProcessInfo.processInfo.environment["TBP_DEBUG"] != nil {
-            NSLog("switcher: panelW=\(frame.width) perRow=\(perRow) w=\(Int(buttonWidth)) shown=\(shown.count)/\(windows.count)")
+            NSLog("switcher: side=\(side) panelW=\(Int(frame.width)) perRow=\(perRow) w=\(Int(buttonWidth)) shown=\(shown.count)/\(windows.count)")
         }
     }
 
@@ -440,17 +537,31 @@ final class TaskbarPanel: NSPanel {
         let nDesktops = max(desktopCount(), windows.map { $0.desktopIndex }.max() ?? 0)
         guard nDesktops > 0 else { return }
 
-        // Split the total available width across the segments (never exceed it, so
-        // the strip can't push the right zone off-screen).
+        // Only show a box for desktops that actually have windows (skip empty ones).
+        var activeDesktops = (1...nDesktops).filter { desk in
+            windows.contains { $0.desktopIndex == desk }
+        }
+        guard !activeDesktops.isEmpty else { reassembleZones(); return }
+
+        // Put the CURRENT desktop's box rightmost (closest to the right edge, fully
+        // visible without hovering); the others stay in order to its left.
+        let current = activeDesktop()
+        if let i = activeDesktops.firstIndex(of: current) {
+            activeDesktops.remove(at: i)
+            activeDesktops.append(current)
+        }
+
+        // Split the available width across the (non-empty) segments.
         let totalAvail = switcherAvailableWidth()
         let segGap = segmentRow.spacing
-        let rawSeg = (totalAvail - CGFloat(nDesktops - 1) * segGap) / CGFloat(nDesktops)
+        let n = CGFloat(activeDesktops.count)
+        let rawSeg = (totalAvail - (n - 1) * segGap) / n
         let segWidth = max(WindowButton.minWidth + 12, rawSeg)
         // Boxes fill (almost) the full bar height.
         let segHeight = Self.barHeight - 10
 
         var newButtons: [WindowButton] = []
-        for desk in 1...nDesktops {
+        for desk in activeDesktops {
             let deskWindows = windows.filter { $0.desktopIndex == desk }
             let seg = makeSegment(windows: deskWindows, width: segWidth, height: segHeight, into: &newButtons)
             segmentRow.addArrangedSubview(seg)
@@ -458,6 +569,9 @@ final class TaskbarPanel: NSPanel {
         reassembleZones()
 
         contentView?.layoutSubtreeIfNeeded()
+        if ProcessInfo.processInfo.environment["TBP_DEBUG"] != nil {
+            NSLog("GROUPED panel=\(frame.size) avail=\(Int(switcherAvailableWidth())) segW=\(Int(segWidth)) rightZone=\(rightZone.frame) segRow=\(segmentRow.frame) switStack=\(switcherStack.frame)")
+        }
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.18; ctx.allowsImplicitAnimation = true
             for b in newButtons { b.animator().alphaValue = 1 }
@@ -474,21 +588,38 @@ final class TaskbarPanel: NSPanel {
         box.layer?.cornerRadius = 5
         box.translatesAutoresizingMaskIntoConstraints = false
 
+        // Align the windows within the box per the switcher's align (right in split
+        // mode, so they sit flush toward the right edge of the group).
+        let segAlign: NSLayoutConstraint.Attribute
+        switch (config.splitMode ? .right : config.align(for: .switcher)) {
+        case .left:   segAlign = .leading
+        case .center: segAlign = .centerX
+        case .right:  segAlign = .trailing
+        }
         let inner = NSStackView()
         inner.orientation = .vertical
-        inner.alignment = .leading
+        inner.alignment = segAlign
         inner.spacing = 3
         inner.translatesAutoresizingMaskIntoConstraints = false
         box.addSubview(inner)
         let widthC = box.widthAnchor.constraint(equalToConstant: width)
         widthC.priority = .defaultHigh   // yield rather than push the right zone off-screen
-        NSLayoutConstraint.activate([
+        // Pin the inner stack to the box edge matching the alignment so the content
+        // actually hugs that side (right edge in split mode); the opposite edge is a
+        // loose bound.
+        var cons: [NSLayoutConstraint] = [
             widthC,
-            box.heightAnchor.constraint(equalToConstant: height),   // full bar height
-            inner.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 4),
-            inner.trailingAnchor.constraint(lessThanOrEqualTo: box.trailingAnchor, constant: -4),
+            box.heightAnchor.constraint(equalToConstant: height),
             inner.centerYAnchor.constraint(equalTo: box.centerYAnchor),
-        ])
+        ]
+        if segAlign == .trailing {
+            cons.append(inner.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -4))
+            cons.append(inner.leadingAnchor.constraint(greaterThanOrEqualTo: box.leadingAnchor, constant: 4))
+        } else {
+            cons.append(inner.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 4))
+            cons.append(inner.trailingAnchor.constraint(lessThanOrEqualTo: box.trailingAnchor, constant: -4))
+        }
+        NSLayoutConstraint.activate(cons)
 
         // Button width to fit within the segment; balance windows over two rows.
         let innerAvail = width - 8
@@ -535,6 +666,14 @@ final class TaskbarPanel: NSPanel {
         func zoneWidth(_ z: Zone) -> CGFloat {
             let s = zoneStack(z)
             return s.arrangedSubviews.isEmpty ? 0 : s.fittingSize.width
+        }
+
+        // Split mode: the switcher spans from the launcher to the right edge. It may
+        // overlap the Dock region in the middle, but that's fine — the bar rests below
+        // the Dock and rises above it on hover, so all windows are reachable. This lets
+        // every window show instead of capping to a narrow strip.
+        if config.splitMode {
+            return max(WindowButton.minWidth, screenW - zoneWidth(.left) - 2 * pad - 2 * gap)
         }
 
         let leftW = zoneWidth(.left)

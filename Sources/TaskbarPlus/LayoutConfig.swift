@@ -82,6 +82,9 @@ struct LayoutConfig {
     var monitors: Monitors
     var theme: Theme
     var spaceMode: SpaceMode
+    /// Coexist with the real macOS Dock: hide pinned/running/others, launcher→left,
+    /// switcher→right, clear clickable center. Rendered as two narrow panels.
+    var splitMode: Bool
 
     static let configPath = URL(fileURLWithPath: NSString("~/.taskbarplus.json").expandingTildeInPath)
 
@@ -91,7 +94,7 @@ struct LayoutConfig {
         .running:  Placement(zone: .left,  expand: nil, align: .left),
         .others:   Placement(zone: .right, expand: nil, align: .right),
         .switcher: Placement(zone: .center, expand: .right, align: .left),
-    ], monitors: .dock, theme: .auto, spaceMode: .currentSpace)
+    ], monitors: .dock, theme: .auto, spaceMode: .currentSpace, splitMode: false)
 
     static func load() -> LayoutConfig {
         guard let data = try? Data(contentsOf: configPath),
@@ -114,7 +117,9 @@ struct LayoutConfig {
         let monitors = (raw["monitors"] as? String).flatMap(Monitors.init) ?? .dock
         let theme = (raw["theme"] as? String).flatMap(Theme.init) ?? .auto
         let spaceMode = (raw["spaceMode"] as? String).flatMap(SpaceMode.init) ?? .currentSpace
-        return LayoutConfig(placements: placements, monitors: monitors, theme: theme, spaceMode: spaceMode)
+        let splitMode = (raw["splitMode"] as? Bool) ?? false
+        return LayoutConfig(placements: placements, monitors: monitors, theme: theme,
+                            spaceMode: spaceMode, splitMode: splitMode)
     }
 
     func placement(for section: Section) -> Placement {
@@ -125,10 +130,30 @@ struct LayoutConfig {
     func expand(for section: Section) -> Expand? { placement(for: section).expand }
     func align(for section: Section) -> Align { placement(for: section).align }
 
+    /// Zone a section actually renders in. In split mode the launcher is forced left
+    /// and the switcher right (so the user can't reach an inconsistent layout); the
+    /// raw per-section placements are preserved in the file for when split is off.
+    func effectiveZone(for section: Section) -> Zone {
+        guard splitMode else { return zone(for: section) }
+        switch section {
+        case .launcher: return .left
+        case .switcher: return .right
+        default:        return zone(for: section)
+        }
+    }
+
+    /// Whether a section renders at all. Split mode shows only launcher + switcher;
+    /// the Dock provides pinned/running/folders/Trash.
+    func sectionIsVisible(_ section: Section) -> Bool {
+        guard splitMode else { return true }
+        return section == .launcher || section == .switcher
+    }
+
     /// Serialize to ~/.taskbarplus.json (pretty-printed, sorted keys).
     func save() {
         var root: [String: Any] = [
             "monitors": monitors.rawValue, "theme": theme.rawValue, "spaceMode": spaceMode.rawValue,
+            "splitMode": splitMode,
         ]
         for section in Section.allCases {
             let p = placement(for: section)

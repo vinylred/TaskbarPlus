@@ -261,6 +261,19 @@ final class SpaceWindowService {
         return spaces.count
     }
 
+    /// 1-based index of the currently-active desktop on the primary display, or 0.
+    func currentDesktopIndex() -> Int {
+        guard let raw = CGSCopyManagedDisplaySpaces(cid),
+              let displays = (raw as NSArray) as? [[String: Any]],
+              let display = displays.first,
+              let spaces = display["Spaces"] as? [[String: Any]],
+              let current = display["Current Space"] as? [String: Any],
+              let cid = spaceID(from: current),
+              let idx = spaces.firstIndex(where: { spaceID(from: $0) == cid })
+        else { return 0 }
+        return idx + 1
+    }
+
     /// The active space id on each display.
     private func currentSpaceIDs() -> Set<UInt64> {
         guard let raw = CGSCopyManagedDisplaySpaces(cid),

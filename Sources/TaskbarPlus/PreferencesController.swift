@@ -14,6 +14,7 @@ final class PreferencesController: NSObject {
     private var alignPickers: [Section: NSSegmentedControl] = [:]
     private var monitorsPicker: NSSegmentedControl!
     private var themePicker: NSSegmentedControl!
+    private var splitModeCheckbox: NSButton!
 
     private static let zones: [Zone] = [.left, .center, .right]
     private static let expands: [Expand?] = [nil, .left, .right]
@@ -27,8 +28,8 @@ final class PreferencesController: NSObject {
         let width: CGFloat = 620
         let rowH: CGFloat = 40
         let sections = Section.allCases
-        // sections + Monitors + Theme + Startup rows.
-        let height = CGFloat(sections.count + 3) * rowH + 90
+        // sections + Monitors + Theme + Mode + Startup rows.
+        let height = CGFloat(sections.count + 4) * rowH + 90
 
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
@@ -129,6 +130,16 @@ final class PreferencesController: NSObject {
         content.addSubview(theme)
         themePicker = theme
 
+        // Split-mode row (coexist with the real Dock).
+        y -= rowH
+        content.addSubview(label("Mode", NSRect(x: 20, y: y, width: 95, height: 22), bold: true))
+        let split = NSButton(checkboxWithTitle: "Split mode (coexist with Dock)",
+                             target: self, action: #selector(changed))
+        split.frame = NSRect(x: 118, y: y - 2, width: 300, height: 24)
+        split.state = config.splitMode ? .on : .off
+        content.addSubview(split)
+        splitModeCheckbox = split
+
         // Start-at-login row (system login item, not part of the JSON config).
         y -= rowH
         content.addSubview(label("Startup", NSRect(x: 20, y: y, width: 95, height: 22), bold: true))
@@ -165,7 +176,8 @@ final class PreferencesController: NSObject {
         let theme = Self.themes[themePicker.selectedSegment]
         // spaceMode is toggled via the bar's Desktop label, not here — preserve it.
         config = LayoutConfig(placements: placements, monitors: monitors, theme: theme,
-                              spaceMode: config.spaceMode)
+                              spaceMode: config.spaceMode,
+                              splitMode: splitModeCheckbox.state == .on)
         onChange(config)
     }
 }

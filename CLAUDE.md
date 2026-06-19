@@ -89,6 +89,17 @@ cycling those three space modes.
   literal `"Main"`, not a UUID — match accordingly when mapping to `NSScreen`.
 - Panels are recreated on display/config change; they `close()` (with
   `isReleasedWhenClosed = false`) and remove observers in `deinit` so they don't leak.
+- **Switcher running off the RIGHT edge (recurring bug — fixed several times):** the
+  switcher/right zone is an `NSStackView` of fixed-width buttons whose intrinsic content
+  width can exceed the space available. The fix has TWO required parts together:
+  (1) the right zone's `trailing` is pinned to the panel's right edge at `.required`, AND
+  (2) it has a `.required` left FLOOR (`rightZone.leading >= leftZone.trailing + gap`) so
+  content shrinks/caps instead of overflowing; the per-button width constraints must be
+  *breakable* (`.defaultHigh`) so they yield. Do NOT let a `centerZone.centerX` pin or a
+  `.defaultHigh` no-overlap guard be the only thing positioning the right zone — that lets
+  it drift off-screen. `switcherAvailableWidth()` must return the real on-screen span
+  (screen − flanking zones − padding), never the full screen width. If the right zone's
+  rendered `frame.maxX` exceeds the panel width, this is the bug — check those constraints.
 
 ## Private APIs
 
