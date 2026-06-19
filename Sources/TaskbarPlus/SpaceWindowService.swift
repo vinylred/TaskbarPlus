@@ -215,7 +215,7 @@ final class SpaceWindowService {
             }
             let icon = icons[r.pid] ?? {
                 let img = NSRunningApplication(processIdentifier: r.pid)?.icon
-                    ?? NSImage(named: NSImage.applicationIconName)!
+                    ?? NSImage(named: NSImage.applicationIconName) ?? NSImage()
                 icons[r.pid] = img
                 return img
             }()

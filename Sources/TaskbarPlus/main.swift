@@ -74,8 +74,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.latestItems = items
             self?.panels.values.forEach { $0.update(items: items) }
         }
-        service.onChange = { [dockModel] apps in
-            dockModel.updateRunning(apps)
+        service.onChange = { [weak dockModel] apps in
+            dockModel?.updateRunning(apps)
         }
         // Windows are routed to each panel filtered to that panel's screen.
         service.onWindowsChange = { [weak self] windows in
