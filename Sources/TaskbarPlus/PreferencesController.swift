@@ -27,8 +27,8 @@ final class PreferencesController: NSObject {
         let width: CGFloat = 620
         let rowH: CGFloat = 40
         let sections = Section.allCases
-        // sections + Monitors row + Theme row.
-        let height = CGFloat(sections.count + 2) * rowH + 90
+        // sections + Monitors + Theme + Startup rows.
+        let height = CGFloat(sections.count + 3) * rowH + 90
 
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
@@ -129,7 +129,21 @@ final class PreferencesController: NSObject {
         content.addSubview(theme)
         themePicker = theme
 
+        // Start-at-login row (system login item, not part of the JSON config).
+        y -= rowH
+        content.addSubview(label("Startup", NSRect(x: 20, y: y, width: 95, height: 22), bold: true))
+        let login = NSButton(checkboxWithTitle: "Start at login",
+                             target: self, action: #selector(toggleLogin(_:)))
+        login.frame = NSRect(x: 118, y: y - 2, width: 220, height: 24)
+        login.state = LoginItem.isEnabled ? .on : .off
+        content.addSubview(login)
+
         window.contentView = content
+    }
+
+    @objc private func toggleLogin(_ sender: NSButton) {
+        let ok = LoginItem.setEnabled(sender.state == .on)
+        if !ok { sender.state = LoginItem.isEnabled ? .on : .off }  // revert on failure
     }
 
     // Encode (section, kind) into a control tag.
@@ -149,7 +163,9 @@ final class PreferencesController: NSObject {
         }
         let monitors: Monitors = (monitorsPicker.selectedSegment == 1) ? .all : .dock
         let theme = Self.themes[themePicker.selectedSegment]
-        config = LayoutConfig(placements: placements, monitors: monitors, theme: theme)
+        // spaceMode is toggled via the bar's Desktop label, not here — preserve it.
+        config = LayoutConfig(placements: placements, monitors: monitors, theme: theme,
+                              spaceMode: config.spaceMode)
         onChange(config)
     }
 }

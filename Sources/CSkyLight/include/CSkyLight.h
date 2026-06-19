@@ -56,4 +56,32 @@ extern CFArrayRef CGSCopySpacesForWindows(CGSConnectionID cid, int selector, CFA
  */
 extern void CoreDockSendNotification(CFStringRef notification, int arg);
 
+/*
+ * Switch a display to a given managed space (used to jump to a window that lives
+ * on another Space before raising it). displayUUID is the "Display Identifier"
+ * from CGSCopyManagedDisplaySpaces ("Main" for the primary). spaceID is the
+ * ManagedSpaceID. Note: mutating space APIs are less stable across macOS versions
+ * than the read-only ones — call defensively.
+ */
+extern void CGSManagedDisplaySetCurrentSpace(CGSConnectionID cid, CFStringRef displayUUID, uint64_t spaceID);
+
+/*
+ * Space show/hide transition. On macOS 26, SetCurrentSpace alone no longer commits
+ * the visible switch; pairing CGSShowSpaces(target) + CGSHideSpaces(current) drives
+ * the WindowServer transition the way Mission Control does. `spaces` is a CFArray of
+ * CFNumber (space ids).
+ */
+extern void CGSShowSpaces(CGSConnectionID cid, CFArrayRef spaces);
+extern void CGSHideSpaces(CGSConnectionID cid, CFArrayRef spaces);
+
+/*
+ * macOS 26 (Tahoe) renamed many CGS* functions to SLS*; the CGS forwarders are
+ * often stale no-ops while the SLS variants are live. Use these for the Space
+ * switch. SLSMainConnectionID gives a connection valid for the SLS calls.
+ */
+extern CGSConnectionID SLSMainConnectionID(void);
+extern void SLSManagedDisplaySetCurrentSpace(CGSConnectionID cid, CFStringRef displayUUID, uint64_t spaceID);
+extern void SLSShowSpaces(CGSConnectionID cid, CFArrayRef spaces);
+extern void SLSHideSpaces(CGSConnectionID cid, CFArrayRef spaces);
+
 #endif /* CSKYLIGHT_H */

@@ -22,6 +22,22 @@ enum Monitors: String {
     case all    // one bar per monitor, each scoped to that monitor's windows
 }
 
+/// Which windows the task switcher lists, and how they're grouped.
+enum SpaceMode: String {
+    case currentSpace   // only windows on the current Space (default)
+    case allSpaces      // all windows across every Space, one flat list
+    case grouped        // all windows, segmented into a bordered box per desktop
+
+    /// Cycle order for the toggle (label click).
+    var next: SpaceMode {
+        switch self {
+        case .currentSpace: return .allSpaces
+        case .allSpaces:    return .grouped
+        case .grouped:      return .currentSpace
+        }
+    }
+}
+
 /// Bar appearance.
 enum Theme: String {
     case auto   // follow the system appearance (default)
@@ -65,6 +81,7 @@ struct LayoutConfig {
     var placements: [Section: Placement]
     var monitors: Monitors
     var theme: Theme
+    var spaceMode: SpaceMode
 
     static let configPath = URL(fileURLWithPath: NSString("~/.taskbarplus.json").expandingTildeInPath)
 
@@ -74,7 +91,7 @@ struct LayoutConfig {
         .running:  Placement(zone: .left,  expand: nil, align: .left),
         .others:   Placement(zone: .right, expand: nil, align: .right),
         .switcher: Placement(zone: .center, expand: .right, align: .left),
-    ], monitors: .dock, theme: .auto)
+    ], monitors: .dock, theme: .auto, spaceMode: .currentSpace)
 
     static func load() -> LayoutConfig {
         guard let data = try? Data(contentsOf: configPath),
@@ -96,7 +113,8 @@ struct LayoutConfig {
         }
         let monitors = (raw["monitors"] as? String).flatMap(Monitors.init) ?? .dock
         let theme = (raw["theme"] as? String).flatMap(Theme.init) ?? .auto
-        return LayoutConfig(placements: placements, monitors: monitors, theme: theme)
+        let spaceMode = (raw["spaceMode"] as? String).flatMap(SpaceMode.init) ?? .currentSpace
+        return LayoutConfig(placements: placements, monitors: monitors, theme: theme, spaceMode: spaceMode)
     }
 
     func placement(for section: Section) -> Placement {
@@ -109,7 +127,9 @@ struct LayoutConfig {
 
     /// Serialize to ~/.taskbarplus.json (pretty-printed, sorted keys).
     func save() {
-        var root: [String: Any] = ["monitors": monitors.rawValue, "theme": theme.rawValue]
+        var root: [String: Any] = [
+            "monitors": monitors.rawValue, "theme": theme.rawValue, "spaceMode": spaceMode.rawValue,
+        ]
         for section in Section.allCases {
             let p = placement(for: section)
             // Use the compact string form only when there's nothing but a zone.

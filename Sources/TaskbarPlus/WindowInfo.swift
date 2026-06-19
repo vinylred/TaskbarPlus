@@ -11,6 +11,8 @@ struct WindowInfo {
     /// Window frame in CoreGraphics global coords (top-left origin), as returned by
     /// CGWindowListCopyWindowInfo. Used to assign the window to a display.
     let frame: CGRect
+    /// 1-based desktop (Space) index this window is on, for grouped mode. 0 if unknown.
+    var desktopIndex: Int = 0
 
     /// What the switcher button displays.
     var displayTitle: String {

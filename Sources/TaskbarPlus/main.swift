@@ -12,9 +12,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panels: [String: TaskbarPanel] = [:]
     private var latestItems: [DockItem] = []
     private var latestWindows: [WindowInfo] = []
-    private var latestDesktop = ""
+    private var latestDesktops: [String: String] = [:]   // display UUID -> "Desktop N"
 
     private func key(_ origin: CGPoint) -> String { "\(origin.x),\(origin.y)" }
+
+    /// The CGS display-UUID string for an NSScreen, to match service desktop names.
+    private func displayUUID(of screen: NSScreen) -> String? {
+        guard let num = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+        else { return nil }
+        let displayID = CGDirectDisplayID(num.uint32Value)
+        guard let cfUUID = CGDisplayCreateUUIDFromDisplayID(displayID)?.takeRetainedValue()
+        else { return nil }
+        return CFUUIDCreateString(nil, cfUUID) as String
+    }
+
+    /// The desktop name for a screen. CGSCopyManagedDisplaySpaces keys the primary
+    /// display as the literal "Main" (not a UUID), so fall back to that for the
+    /// primary screen (frame origin .zero) when the UUID doesn't match.
+    private func desktopName(for screen: NSScreen) -> String? {
+        if let uuid = displayUUID(of: screen), let n = latestDesktops[uuid] { return n }
+        if screen.frame.origin == .zero, let n = latestDesktops["Main"] { return n }
+        return nil
+    }
+
+    /// Push each panel its own screen's desktop name.
+    private func applyDesktopNames() {
+        // In all-spaces / grouped modes every bar shows a mode label; in current-Space
+        // mode each shows its own current desktop.
+        switch config.spaceMode {
+        case .allSpaces:
+            panels.values.forEach { $0.updateDesktop("All Desktops") }
+            return
+        case .grouped:
+            panels.values.forEach { $0.updateDesktop("Grouped") }
+            return
+        case .currentSpace:
+            break
+        }
+        for screen in NSScreen.screens {
+            guard let panel = panels[key(screen.frame.origin)],
+                  let name = desktopName(for: screen) else { continue }
+            panel.updateDesktop(name)
+        }
+    }
+
+    /// Cycle current-Space → all-Spaces → grouped, persist, and refresh.
+    private func toggleSpaceMode() {
+        config.spaceMode = config.spaceMode.next
+        config.save()
+        service.spaceMode = config.spaceMode   // triggers refreshNow()
+        panels.values.forEach { $0.setGrouped(config.spaceMode == .grouped) }
+        applyDesktopNames()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
@@ -33,10 +82,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.latestWindows = windows
             self?.distributeWindows()
         }
-        // Current desktop name shown under the Apps button (same on all bars).
-        service.onDesktopChange = { [weak self] name in
-            self?.latestDesktop = name
-            self?.panels.values.forEach { $0.updateDesktop(name) }
+        // Per-display desktop name shown under each bar's Apps button (each monitor
+        // has its own current Space / numbering).
+        service.onDesktopChange = { [weak self] names in
+            self?.latestDesktops = names
+            self?.applyDesktopNames()
         }
 
         // Recreate panels when displays change (plug/unplug, resolution).
@@ -45,8 +95,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSApplication.didChangeScreenParametersNotification, object: nil)
 
         WindowControl.requestPermissions()
+        DesktopSwitcher.ensureShortcutsEnabled()   // Ctrl+N desktop shortcuts for cross-space clicks
+        service.spaceMode = config.spaceMode   // restore persisted mode
         dockModel.start()
         service.start()
+        applyDesktopNames()
     }
 
     @objc private func displaysChanged() {
@@ -122,7 +175,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for screen in wanted where panels[key(screen.frame.origin)] == nil {
             let panel = TaskbarPanel(screen: screen, config: config)
             panel.onCloseRequested = { [weak self] in self?.service.refreshNow() }
-            if !latestDesktop.isEmpty { panel.updateDesktop(latestDesktop) }
+            panel.onToggleSpaceMode = { [weak self] in self?.toggleSpaceMode() }
+            panel.onIsWindowOnOtherSpace = { [weak self] num in
+                self?.service.isWindowOnOtherSpace(num) ?? false
+            }
+            panel.desktopCount = { [weak self] in self?.service.desktopCount() ?? 0 }
+            panel.setGrouped(config.spaceMode == .grouped)
+            if config.spaceMode == .allSpaces {
+                panel.updateDesktop("All Desktops")
+            } else if let name = desktopName(for: screen) {
+                panel.updateDesktop(name)
+            }
             panels[key(screen.frame.origin)] = panel
         }
     }

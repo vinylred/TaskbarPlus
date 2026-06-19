@@ -12,14 +12,19 @@ final class SpaceWindowService {
     /// Called on the main thread with the ordered list of apps to display.
     var onChange: (([NSRunningApplication]) -> Void)?
 
+    /// Whether the switcher lists windows on the current Space only, or all Spaces.
+    var spaceMode: SpaceMode = .currentSpace {
+        didSet { if spaceMode != oldValue { refreshNow() } }
+    }
+
     /// Called on the main thread with the windows open on the current Space,
     /// in stable left-to-right order (for the task switcher).
     var onWindowsChange: (([WindowInfo]) -> Void)?
 
-    /// Called on the main thread with the current desktop label ("Desktop N") when
-    /// it changes.
-    var onDesktopChange: ((String) -> Void)?
-    private var lastDesktopName = ""
+    /// Called on the main thread with the per-display desktop labels (keyed by
+    /// display UUID) when any of them change.
+    var onDesktopChange: (([String: String]) -> Void)?
+    private var lastDesktopNames: [String: String] = [:]
 
     /// Distinct app count from the last accepted window scan, used to detect the
     /// transient collapse to a single app during App Exposé / Mission Control.
@@ -45,15 +50,19 @@ final class SpaceWindowService {
 
     func start() {
         let wsCenter = NSWorkspace.shared.notificationCenter
-        let names: [Notification.Name] = [
-            NSWorkspace.activeSpaceDidChangeNotification,
+        // A Space switch is a definitive event — refresh immediately (skip the
+        // debounce + anti-flicker hysteresis) so the new windows appear at once.
+        wsCenter.addObserver(self, selector: #selector(spaceChanged),
+                             name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
+        // App-level events are debounced (they can arrive in bursts).
+        let debounced: [Notification.Name] = [
             NSWorkspace.didLaunchApplicationNotification,
             NSWorkspace.didTerminateApplicationNotification,
             NSWorkspace.didActivateApplicationNotification,
             NSWorkspace.didHideApplicationNotification,
             NSWorkspace.didUnhideApplicationNotification,
         ]
-        for name in names {
+        for name in debounced {
             wsCenter.addObserver(self, selector: #selector(scheduleRefresh),
                                  name: name, object: nil)
         }
@@ -72,6 +81,8 @@ final class SpaceWindowService {
 
         refresh()
     }
+
+    @objc private func spaceChanged() { refreshNow() }
 
     /// Coalesce bursts of notifications (a Space switch emits several).
     @objc private func scheduleRefresh() {
@@ -120,10 +131,10 @@ final class SpaceWindowService {
         onChange?(apps)
         onWindowsChange?(orderedWindows)
 
-        let desktop = currentDesktopName()
-        if desktop != lastDesktopName {
-            lastDesktopName = desktop
-            onDesktopChange?(desktop)
+        let desktops = currentDesktopNames()
+        if desktops != lastDesktopNames {
+            lastDesktopNames = desktops
+            onDesktopChange?(desktops)
         }
     }
 
@@ -132,12 +143,16 @@ final class SpaceWindowService {
     /// All normal windows on the current Space (title, owner, icon), or nil if the
     /// private query path fails (signature drift / empty results).
     private func currentSpaceWindows() -> [WindowInfo]? {
+        // Both all-spaces and grouped modes enumerate every Space's windows.
+        let allSpaces = (spaceMode == .allSpaces || spaceMode == .grouped)
         let currentSpaces = currentSpaceIDs()
-        guard !currentSpaces.isEmpty else { return nil }
+        guard allSpaces || !currentSpaces.isEmpty else { return nil }
 
-        // Public enumeration of on-screen windows. `kCGWindowName` (title) requires
-        // Screen Recording permission; it comes back absent/empty otherwise.
-        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        // `.optionOnScreenOnly` returns only the current Space's windows; omitting it
+        // (all-spaces mode) returns windows across every Space. `kCGWindowName`
+        // (title) requires Screen Recording permission; absent/empty otherwise.
+        var opts: CGWindowListOption = [.excludeDesktopElements]
+        if !allSpaces { opts.insert(.optionOnScreenOnly) }
         guard let infoList = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]],
               !infoList.isEmpty else { return nil }
 
@@ -151,8 +166,14 @@ final class SpaceWindowService {
             if let alpha = info[kCGWindowAlpha as String] as? Double, alpha <= 0 { continue }
             guard let b = info[kCGWindowBounds as String] as? [String: Any],
                   let x = b["X"] as? Double, let y = b["Y"] as? Double,
-                  let w = b["Width"] as? Double, let h = b["Height"] as? Double,
-                  w > 1, h > 1 else { continue }
+                  let w = b["Width"] as? Double, let h = b["Height"] as? Double else { continue }
+            // Real document windows are reasonably sized; tiny ones are usually
+            // helper/agent panels (e.g. Google Drive's menu-bar window).
+            guard w >= 80, h >= 80 else { continue }
+            // Only windows belonging to regular (Dock-visible) apps — drops menu-bar
+            // agents/accessories like Google Drive that have no real window.
+            guard let runApp = NSRunningApplication(processIdentifier: pid_t(pid)),
+                  runApp.activationPolicy == .regular else { continue }
             // Keep CGWindow bounds as-is (top-left origin, global CG space). Screen
             // matching is done in CG space too, avoiding a fragile coordinate flip
             // that breaks for displays positioned above/left of the primary.
@@ -171,22 +192,73 @@ final class SpaceWindowService {
             raws = raws.filter { !$0.title.isEmpty }
         }
 
-        // Keep only windows whose space is current.
+        // Dedupe by (pid, title): some apps (e.g. Teams) report a main window plus a
+        // WebView/helper window with the same title — collapse to one button.
+        var seen = Set<String>()
+        raws = raws.filter { seen.insert("\($0.pid):\($0.title)").inserted }
+
+        // Multi-space modes need each window's desktop index (for grouping and for
+        // the click → switch-to-its-desktop chain).
+        let grouped = (spaceMode == .grouped)
+        let multiSpace = allSpaces || grouped
+        let spaceIndex = multiSpace ? spaceIDToDesktopIndex() : [:]
+
         var icons: [pid_t: NSImage] = [:]
         var result: [WindowInfo] = []
+        // Per-window space ids needed for the current-Space filter (currentSpace mode)
+        // and desktop tagging (all multi-space modes).
+        let needSpaceIDs = !allSpaces || multiSpace
         for r in raws {
-            let ids = spaceIDs(forWindowNumbers: [r.num])
-            guard ids.contains(where: { currentSpaces.contains($0) }) else { continue }
+            let ids = needSpaceIDs ? spaceIDs(forWindowNumbers: [r.num]) : []
+            if !allSpaces {
+                guard ids.contains(where: { currentSpaces.contains($0) }) else { continue }
+            }
             let icon = icons[r.pid] ?? {
                 let img = NSRunningApplication(processIdentifier: r.pid)?.icon
                     ?? NSImage(named: NSImage.applicationIconName)!
                 icons[r.pid] = img
                 return img
             }()
+            let desktopIdx = multiSpace ? (ids.compactMap { spaceIndex[$0] }.min() ?? 0) : 0
             result.append(WindowInfo(windowNumber: r.num, pid: r.pid,
-                                     ownerName: r.owner, title: r.title, icon: icon, frame: r.frame))
+                                     ownerName: r.owner, title: r.title, icon: icon,
+                                     frame: r.frame, desktopIndex: desktopIdx))
         }
         return result.isEmpty ? nil : result
+    }
+
+    /// Whether a window lives on a Space other than a currently-visible one.
+    /// (macOS 26 blocks programmatic Space switching, so cross-Space clicks fall back
+    /// to plain app activation — this just tells the panel which path to take.)
+    func isWindowOnOtherSpace(_ windowNumber: Int) -> Bool {
+        let target = spaceIDs(forWindowNumbers: [windowNumber])
+        guard !target.isEmpty else { return false }
+        let current = currentSpaceIDs()
+        return !target.contains(where: { current.contains($0) })
+    }
+
+    /// Map each Space id → its 1-based desktop index, using the primary display's
+    /// ordered Spaces list (matches the per-display numbering used elsewhere).
+    private func spaceIDToDesktopIndex() -> [UInt64: Int] {
+        guard let raw = CGSCopyManagedDisplaySpaces(cid),
+              let displays = (raw as NSArray) as? [[String: Any]] else { return [:] }
+        var map: [UInt64: Int] = [:]
+        for display in displays {
+            guard let spaces = display["Spaces"] as? [[String: Any]] else { continue }
+            for (i, s) in spaces.enumerated() {
+                if let id = spaceID(from: s) { map[id] = i + 1 }
+            }
+        }
+        return map
+    }
+
+    /// Total desktop (Space) count on the primary display, for grouped segments.
+    func desktopCount() -> Int {
+        guard let raw = CGSCopyManagedDisplaySpaces(cid),
+              let displays = (raw as NSArray) as? [[String: Any]],
+              let display = displays.first,
+              let spaces = display["Spaces"] as? [[String: Any]] else { return 0 }
+        return spaces.count
     }
 
     /// The active space id on each display.
@@ -209,13 +281,30 @@ final class SpaceWindowService {
         return nil
     }
 
-    /// Human label for the current Space, e.g. "Desktop 2" — the 1-based index of
-    /// the active space within the primary display's ordered Spaces list. Fullscreen
-    /// spaces count too (matching Mission Control's numbering). Falls back to "Desktop".
+    /// Current-Space label ("Desktop N") for EACH display, keyed by its display UUID
+    /// string — each monitor has its own current Space and its own numbering.
+    func currentDesktopNames() -> [String: String] {
+        guard let raw = CGSCopyManagedDisplaySpaces(cid),
+              let displays = (raw as NSArray) as? [[String: Any]] else { return [:] }
+        var result: [String: String] = [:]
+        for display in displays {
+            guard let uuid = display["Display Identifier"] as? String,
+                  let spaces = display["Spaces"] as? [[String: Any]],
+                  let current = display["Current Space"] as? [String: Any],
+                  let currentID = spaceID(from: current) else { continue }
+            if let idx = spaces.firstIndex(where: { spaceID(from: $0) == currentID }) {
+                result[uuid] = "Desktop \(idx + 1)"
+            } else {
+                result[uuid] = "Desktop"
+            }
+        }
+        return result
+    }
+
+    /// Back-compat single-name (primary display).
     func currentDesktopName() -> String {
         guard let raw = CGSCopyManagedDisplaySpaces(cid),
               let displays = (raw as NSArray) as? [[String: Any]],
-              // Use the display that has the menu bar (primary) when there are several.
               let display = displays.first else { return "Desktop" }
         guard let spaces = display["Spaces"] as? [[String: Any]],
               let current = display["Current Space"] as? [String: Any],
