@@ -31,6 +31,13 @@ final class SpaceWindowService {
     var onFullscreenChange: ((Bool) -> Void)?
     private var lastFullscreen: Bool?
 
+    /// Signatures of the last EMITTED app / window payloads, so the 0.5s safety poll
+    /// only fires the callbacks (and the downstream Dock-model rebuild + view diff)
+    /// when the payload actually changed. Without these, every idle poll rebuilt the
+    /// whole DockItem model and re-indexed all running apps for nothing.
+    private var lastAppsSignature = ""
+    private var lastWindowsSignature = ""
+
     /// Distinct app count from the last accepted window scan, used to detect the
     /// transient collapse to a single app during App Exposé / Mission Control.
     private var lastAppCount = 0
@@ -141,8 +148,23 @@ final class SpaceWindowService {
             let mode = detected == nil ? "FALLBACK(all-apps)" : "current-space"
             NSLog("TaskbarPlus[\(mode)] spaces=\(currentSpaceIDs().sorted()) apps=\(apps.map { $0.localizedName ?? "?" }) windows=\(orderedWindows.count)")
         }
-        onChange?(apps)
-        onWindowsChange?(orderedWindows)
+        // Only emit when the payload actually changed — the 0.5s poll otherwise drives
+        // a full Dock-model rebuild + view diff twice a second at idle. (A Space switch
+        // / explicit refreshNow still flows through here; if the content is genuinely
+        // identical there's nothing to redraw anyway. The grouped-mode active-desktop
+        // indicator is refreshed via onDesktopChange/setGrouped, not this guard.)
+        let appsSig = apps.map { "\($0.processIdentifier)" }.joined(separator: ",")
+        if appsSig != lastAppsSignature {
+            lastAppsSignature = appsSig
+            onChange?(apps)
+        }
+        // Include the current desktop index so a Space switch still re-emits even when
+        // the window set is identical (grouped mode moves the active-desktop indicator).
+        let winSig = "\(currentDesktopIndex())|" + orderedWindows.map { "\($0.windowNumber):\($0.displayTitle):\($0.desktopIndex)" }.joined(separator: "|")
+        if winSig != lastWindowsSignature {
+            lastWindowsSignature = winSig
+            onWindowsChange?(orderedWindows)
+        }
 
         let desktops = currentDesktopNames()
         if desktops != lastDesktopNames {

@@ -38,6 +38,12 @@ enum SpaceMode: String {
     }
 }
 
+/// In grouped space mode, how the per-desktop boxes are ordered left→right.
+enum GroupedOrder: String {
+    case `default`        // natural desktop sequence (1, 2, 3, …) — the default
+    case currentToRight   // move the current desktop's box to the rightmost position
+}
+
 /// Bar appearance.
 enum Theme: String {
     case auto   // follow the system appearance (default)
@@ -82,6 +88,8 @@ struct LayoutConfig {
     var monitors: Monitors
     var theme: Theme
     var spaceMode: SpaceMode
+    /// Grouped-mode box ordering (see `GroupedOrder`).
+    var groupedOrder: GroupedOrder = .default
     /// Coexist with the real macOS Dock: hide pinned/running/others, launcher→left,
     /// switcher→right, clear clickable center. Rendered as two narrow panels.
     var splitMode: Bool
@@ -117,9 +125,10 @@ struct LayoutConfig {
         let monitors = (raw["monitors"] as? String).flatMap(Monitors.init) ?? .dock
         let theme = (raw["theme"] as? String).flatMap(Theme.init) ?? .auto
         let spaceMode = (raw["spaceMode"] as? String).flatMap(SpaceMode.init) ?? .currentSpace
+        let groupedOrder = (raw["groupedOrder"] as? String).flatMap(GroupedOrder.init) ?? .default
         let splitMode = (raw["splitMode"] as? Bool) ?? false
         return LayoutConfig(placements: placements, monitors: monitors, theme: theme,
-                            spaceMode: spaceMode, splitMode: splitMode)
+                            spaceMode: spaceMode, groupedOrder: groupedOrder, splitMode: splitMode)
     }
 
     func placement(for section: Section) -> Placement {
@@ -153,7 +162,7 @@ struct LayoutConfig {
     func save() {
         var root: [String: Any] = [
             "monitors": monitors.rawValue, "theme": theme.rawValue, "spaceMode": spaceMode.rawValue,
-            "splitMode": splitMode,
+            "groupedOrder": groupedOrder.rawValue, "splitMode": splitMode,
         ]
         for section in Section.allCases {
             let p = placement(for: section)

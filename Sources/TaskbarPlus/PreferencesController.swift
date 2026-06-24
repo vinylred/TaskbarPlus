@@ -14,12 +14,14 @@ final class PreferencesController: NSObject {
     private var alignPickers: [Section: NSSegmentedControl] = [:]
     private var monitorsPicker: NSSegmentedControl!
     private var themePicker: NSSegmentedControl!
+    private var groupedOrderPicker: NSSegmentedControl!
     private var splitModeCheckbox: NSButton!
 
     private static let zones: [Zone] = [.left, .center, .right]
     private static let expands: [Expand?] = [nil, .left, .right]
     private static let aligns: [Align] = [.left, .center, .right]
     private static let themes: [Theme] = [.auto, .light, .dark]
+    private static let groupedOrders: [GroupedOrder] = [.default, .currentToRight]
 
     init(config: LayoutConfig, onChange: @escaping (LayoutConfig) -> Void) {
         self.config = config
@@ -28,8 +30,8 @@ final class PreferencesController: NSObject {
         let width: CGFloat = 620
         let rowH: CGFloat = 40
         let sections = Section.allCases
-        // sections + Monitors + Theme + Mode + Startup rows.
-        let height = CGFloat(sections.count + 4) * rowH + 90
+        // sections + Monitors + Theme + Grouped-order + Mode + Startup rows.
+        let height = CGFloat(sections.count + 5) * rowH + 90
 
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
@@ -46,6 +48,13 @@ final class PreferencesController: NSObject {
         window.center()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    /// Keep the controller's config in sync with changes made OUTSIDE the prefs pane
+    /// (e.g. the bar's Desktop label toggling spaceMode). Without this, the next change
+    /// in the pane would write back this stale spaceMode and revert the bar's mode.
+    func syncConfig(_ newConfig: LayoutConfig) {
+        config = newConfig
     }
 
     // MARK: - UI construction
@@ -130,6 +139,17 @@ final class PreferencesController: NSObject {
         content.addSubview(theme)
         themePicker = theme
 
+        // Grouped-order row (only affects grouped space mode).
+        y -= rowH
+        content.addSubview(label("Grouped order", NSRect(x: 20, y: y, width: 95, height: 22), bold: true))
+        let gorder = NSSegmentedControl(labels: ["Default", "Current → right"],
+                                        trackingMode: .selectOne,
+                                        target: self, action: #selector(changed))
+        gorder.frame = NSRect(x: 120, y: y - 2, width: 240, height: 24)
+        gorder.selectedSegment = Self.groupedOrders.firstIndex(of: config.groupedOrder) ?? 0
+        content.addSubview(gorder)
+        groupedOrderPicker = gorder
+
         // Split-mode row (coexist with the real Dock).
         y -= rowH
         content.addSubview(label("Mode", NSRect(x: 20, y: y, width: 95, height: 22), bold: true))
@@ -174,9 +194,10 @@ final class PreferencesController: NSObject {
         }
         let monitors: Monitors = (monitorsPicker.selectedSegment == 1) ? .all : .dock
         let theme = Self.themes[themePicker.selectedSegment]
+        let groupedOrder = Self.groupedOrders[groupedOrderPicker.selectedSegment]
         // spaceMode is toggled via the bar's Desktop label, not here — preserve it.
         config = LayoutConfig(placements: placements, monitors: monitors, theme: theme,
-                              spaceMode: config.spaceMode,
+                              spaceMode: config.spaceMode, groupedOrder: groupedOrder,
                               splitMode: splitModeCheckbox.state == .on)
         onChange(config)
     }

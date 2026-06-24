@@ -122,7 +122,7 @@ final class TaskbarPanel: NSPanel {
         switcherStack.addArrangedSubview(switcherRow2)
         // Grouped-mode segment row (sibling of the two rows; only one is shown).
         segmentRow.orientation = .horizontal
-        segmentRow.alignment = .centerY
+        segmentRow.alignment = .top   // boxes share a top edge; the active underline hangs below
         segmentRow.spacing = 8
         segmentRow.isHidden = true
         switcherStack.addArrangedSubview(segmentRow)
@@ -480,7 +480,7 @@ final class TaskbarPanel: NSPanel {
     private func rebuildSwitcher(_ windows: [WindowInfo], force: Bool) {
         // Include the active desktop so grouped mode re-orders (active box rightmost)
         // when the Space changes even if the window set is identical.
-        let activeKey = grouped ? "\(activeDesktop())" : ""
+        let activeKey = grouped ? "\(activeDesktop())|\(config.groupedOrder.rawValue)" : ""
         let signature = "\(grouped)|\(activeKey)|" + windows.map { "\($0.windowNumber):\($0.displayTitle):\($0.desktopIndex)" }.joined(separator: "|")
         if !force, signature == switcherSignature { return }
         switcherSignature = signature
@@ -567,10 +567,11 @@ final class TaskbarPanel: NSPanel {
         }
         guard !activeDesktops.isEmpty else { reassembleZones(); return }
 
-        // Put the CURRENT desktop's box rightmost (closest to the right edge, fully
-        // visible without hovering); the others stay in order to its left.
+        // Box ordering. `.default` keeps the natural desktop sequence (1, 2, 3, …);
+        // `.currentToRight` moves the current desktop's box to the rightmost position
+        // (closest to the right edge, fully visible without hovering).
         let current = activeDesktop()
-        if let i = activeDesktops.firstIndex(of: current) {
+        if config.groupedOrder == .currentToRight, let i = activeDesktops.firstIndex(of: current) {
             activeDesktops.remove(at: i)
             activeDesktops.append(current)
         }
@@ -588,20 +589,22 @@ final class TaskbarPanel: NSPanel {
         let n = CGFloat(activeDesktops.count)
         let rawSeg = (totalAvail - (n - 1) * segGap) / n
         let segWidth = max(minSeg, rawSeg)
-        // Boxes fill (almost) the full bar height.
-        let segHeight = Self.barHeight - 10
+        // Boxes fill (almost) the full bar height; leave a little room below for the
+        // active desktop's underline (which sits outside the box).
+        let segHeight = Self.barHeight - 14
 
         var newButtons: [WindowButton] = []
         for desk in activeDesktops {
             let deskWindows = windows.filter { $0.desktopIndex == desk }
-            let seg = makeSegment(windows: deskWindows, width: segWidth, height: segHeight, into: &newButtons)
+            let seg = makeSegment(windows: deskWindows, width: segWidth, height: segHeight,
+                                  isActive: desk == current, into: &newButtons)
             segmentRow.addArrangedSubview(seg)
         }
         reassembleZones()
 
         contentView?.layoutSubtreeIfNeeded()
         if ProcessInfo.processInfo.environment["TBP_DEBUG"] != nil {
-            NSLog("GROUPED panel=\(frame.size) avail=\(Int(switcherAvailableWidth())) segW=\(Int(segWidth)) rightZone=\(rightZone.frame) segRow=\(segmentRow.frame) switStack=\(switcherStack.frame)")
+            NSLog("GROUPED active=\(current) order=\(activeDesktops) panel=\(frame.size) avail=\(Int(switcherAvailableWidth())) segW=\(Int(segWidth))")
         }
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.18; ctx.allowsImplicitAnimation = true
@@ -610,14 +613,59 @@ final class TaskbarPanel: NSPanel {
     }
 
     /// A bordered box for one desktop, containing its windows across two inner rows.
+    /// The active desktop gets an underline BELOW the box so it's easy to spot at a glance.
     private func makeSegment(windows: [WindowInfo], width: CGFloat, height: CGFloat,
-                             into newButtons: inout [WindowButton]) -> NSView {
+                             isActive: Bool, into newButtons: inout [WindowButton]) -> NSView {
+        let boxIsDark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
         let box = NSView()
         box.wantsLayer = true
-        box.layer?.borderColor = NSColor.separatorColor.cgColor
+        // Thin theme-aware hairline around each group. separatorColor.cgColor is both very
+        // faint and static (won't adapt to light/dark), so resolve a foreground tint within
+        // our effectiveAppearance instead.
+        box.layer?.borderColor = (boxIsDark ? NSColor.white : NSColor.black)
+            .withAlphaComponent(0.18).cgColor
         box.layer?.borderWidth = 1
         box.layer?.cornerRadius = 5
         box.translatesAutoresizingMaskIntoConstraints = false
+
+        // The active desktop gets an underline sitting OUTSIDE and just under the box
+        // (like a tab/segmented-control selection). Color follows the bar's theme —
+        // resolve the foreground color within our effectiveAppearance, since a CALayer's
+        // cgColor is static and won't otherwise adapt to light/dark.
+        var underline: NSView? = nil
+        if isActive {
+            let line = NSView()
+            line.wantsLayer = true
+            let isDark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            line.layer?.backgroundColor = (isDark ? NSColor.white : NSColor.black)
+                .withAlphaComponent(0.85).cgColor
+            line.layer?.cornerRadius = 1.5
+            line.translatesAutoresizingMaskIntoConstraints = false
+            underline = line
+        }
+
+        // Wrap [box] + [underline] in a vertical container so the underline is genuinely
+        // BELOW the bordered box, not drawn inside it.
+        let segment = NSView()
+        segment.translatesAutoresizingMaskIntoConstraints = false
+        segment.addSubview(box)
+        NSLayoutConstraint.activate([
+            box.topAnchor.constraint(equalTo: segment.topAnchor),
+            box.leadingAnchor.constraint(equalTo: segment.leadingAnchor),
+            box.trailingAnchor.constraint(equalTo: segment.trailingAnchor),
+        ])
+        if let line = underline {
+            segment.addSubview(line)
+            NSLayoutConstraint.activate([
+                line.topAnchor.constraint(equalTo: box.bottomAnchor, constant: 2),
+                line.centerXAnchor.constraint(equalTo: box.centerXAnchor),
+                line.heightAnchor.constraint(equalToConstant: 3),
+                line.widthAnchor.constraint(equalTo: box.widthAnchor, multiplier: 0.5),
+                line.bottomAnchor.constraint(equalTo: segment.bottomAnchor),
+            ])
+        } else {
+            box.bottomAnchor.constraint(equalTo: segment.bottomAnchor).isActive = true
+        }
 
         // Align the windows within the box per the switcher's align (right in split
         // mode, so they sit flush toward the right edge of the group).
@@ -680,7 +728,7 @@ final class TaskbarPanel: NSPanel {
             newButtons.append(btn)
         }
         row2.isHidden = row2.arrangedSubviews.isEmpty
-        return box
+        return segment
     }
 
     /// Width available to ONE switcher row, given the switcher's zone and the space
@@ -1335,7 +1383,11 @@ final class TooltipWindow {
         let onScreen = window.convertToScreen(view.convert(rect, to: nil))
         let width = label.intrinsicContentSize.width + 24
         let x = onScreen.midX - width / 2
-        let y = onScreen.maxY + 6
+        // Anchor Y to the BAR's top edge, not the hovered item's rect — so every
+        // tooltip (app icon, switcher chip, etc.) sits at the SAME height above the bar,
+        // a single consistent place to read, like the Dock. Using the item rect made
+        // tooltips land at different heights as item rects varied within the bar.
+        let y = window.frame.maxY + 6
         panel.setFrame(NSRect(x: x, y: y, width: width, height: Self.height), display: true)
         panel.orderFront(nil)
     }

@@ -81,6 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         service.spaceMode = config.spaceMode   // triggers refreshNow()
         panels.values.forEach { $0.setGrouped(config.spaceMode == .grouped) }
         applyDesktopNames()
+        prefs?.syncConfig(config)   // so a later prefs edit doesn't revert the mode
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
