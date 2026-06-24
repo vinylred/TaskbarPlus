@@ -80,14 +80,27 @@ final class TaskbarPanel: NSPanel {
         // visual-effect view, label colors, and the Win95 buttons' effectiveAppearance.
         appearance = config.theme.appearance
 
+        // Frosted blur background (the original look). `.sidebar` adapts to light/dark.
         let blur = NSVisualEffectView()
-        // `.sidebar` adapts cleanly to both light and dark (the old `.hudWindow` was
-        // always dark regardless of appearance).
         blur.material = .sidebar
         blur.blendingMode = .behindWindow
         blur.state = .active
         blur.translatesAutoresizingMaskIntoConstraints = false
         contentView = blur
+        // HARD-clamp the blur to a FIXED width/height (set per screen in reposition()).
+        // A borderless panel whose contentView uses autolayout otherwise lets the
+        // content's intrinsic width grow the window's content rect past the window frame
+        // (observed: window 1512 but contentView 1681 → Trash + right chips rendered off
+        // the visible edge and got clipped). A required constant width forces the layout
+        // engine to compress the (breakable) switcher chips into the real on-screen width
+        // instead of ballooning the canvas. Pinning to the superview/themeFrame did NOT
+        // work — that lets the themeFrame grow with the content; a constant does not.
+        let bw = blur.widthAnchor.constraint(equalToConstant: 100)
+        let bh = blur.heightAnchor.constraint(equalToConstant: Self.barHeight)
+        bw.priority = .required
+        bh.priority = .required
+        NSLayoutConstraint.activate([bw, bh])
+        blurWidthConstraint = bw
 
         for s in [launcherStack, pinnedStack, runningStack, othersStack] {
             s.orientation = .horizontal
@@ -215,6 +228,10 @@ final class TaskbarPanel: NSPanel {
         // center (bar is below the Dock's window level), launcher/switcher show at edges.
         let area = config.splitMode ? screen.frame : screen.visibleFrame
         setFrame(NSRect(x: area.minX, y: area.minY, width: area.width, height: h), display: true)
+        // Clamp the blur (contentView) to exactly the panel width so its content can't
+        // balloon the content rect past the window and clip the right zone.
+        blurWidthConstraint?.constant = area.width
+        contentView?.layoutSubtreeIfNeeded()
         installHoverTracking()
     }
 
@@ -364,6 +381,9 @@ final class TaskbarPanel: NSPanel {
     }
 
     private var switcherExpandConstraints: [NSLayoutConstraint] = []
+    /// Required constant width on the blur, kept equal to the panel's on-screen width
+    /// so autolayout can't balloon the content rect past the window (see contentView setup).
+    private var blurWidthConstraint: NSLayoutConstraint?
 
     /// If the switcher is configured to expand, pull it OUT of its zone stack and
     /// pin its edges directly to the blur so it spans exactly the gap toward the
@@ -403,17 +423,21 @@ final class TaskbarPanel: NSPanel {
         switcherStack.translatesAutoresizingMaskIntoConstraints = false
 
         let gap: CGFloat = 16
-        // Bound the switcher BETWEEN the flanking zones with inequalities, so it can
-        // never overlap them or run off-screen — but does NOT stretch them (an
-        // equality pin was forcing rightZone wide, pushing Trash off the right edge).
-        // The switcher is content-sized; `align` positions it within these bounds via
-        // the bias constraint below.
+        // The switcher is the SINGLE variable-width element. Fixed content pins to its
+        // edge — launcher + icons left, Trash right — and the switcher fills the gap
+        // between them. Bound it required between the two zones so it can never overlap
+        // them or run off-screen; its breakable (.defaultHigh) chip widths compress to
+        // fit. A .defaultHigh bias positions it toward the configured align edge when
+        // there's slack. (The flanking zones own their own edge pins; the switcher just
+        // takes what's left. The earlier off-screen bug was the blur ballooning past the
+        // window width, fixed at contentView setup — not this logic.)
         let leadingBound = switcherStack.leadingAnchor.constraint(
             greaterThanOrEqualTo: leftZone.trailingAnchor, constant: gap)
+        leadingBound.priority = .required
         let trailingBound = switcherStack.trailingAnchor.constraint(
             lessThanOrEqualTo: rightZone.leadingAnchor, constant: -gap)
+        trailingBound.priority = .required
 
-        // Position bias per align (breakable, so the hard bounds always win).
         let bias: NSLayoutConstraint
         switch align {
         case .left:
@@ -551,12 +575,19 @@ final class TaskbarPanel: NSPanel {
             activeDesktops.append(current)
         }
 
-        // Split the available width across the (non-empty) segments.
+        // Split the available width across the (non-empty) segments. If they can't all
+        // fit even at the minimum segment width, drop the LEFTMOST (oldest) desktops —
+        // the active desktop (rightmost) and nearest neighbours stay.
         let totalAvail = switcherAvailableWidth()
         let segGap = segmentRow.spacing
+        let minSeg = WindowButton.minWidth + 12
+        let maxFit = max(1, Int((totalAvail + segGap) / (minSeg + segGap)))
+        if activeDesktops.count > maxFit {
+            activeDesktops = Array(activeDesktops.suffix(maxFit))   // keep rightmost (active) ones
+        }
         let n = CGFloat(activeDesktops.count)
         let rawSeg = (totalAvail - (n - 1) * segGap) / n
-        let segWidth = max(WindowButton.minWidth + 12, rawSeg)
+        let segWidth = max(minSeg, rawSeg)
         // Boxes fill (almost) the full bar height.
         let segHeight = Self.barHeight - 10
 
@@ -1080,9 +1111,14 @@ final class WindowButton: NSView {
         // dropped). The label truncates within whatever width we get.
         label.setContentHuggingPriority(.defaultLow, for: .horizontal)
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        // Width must be BREAKABLE (see CLAUDE.md "switcher off right edge"): a required
+        // width would win over the switcher's .defaultHigh trailing bound and shove the
+        // chips — and the Trash zone — off the right edge. Keep it high but yielding.
+        let widthC = widthAnchor.constraint(equalToConstant: width)
+        widthC.priority = .defaultHigh
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: Self.height),
-            widthAnchor.constraint(equalToConstant: width),
+            widthC,
             iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 5),
             iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
             iconView.widthAnchor.constraint(equalToConstant: 16),
@@ -1147,37 +1183,22 @@ final class WindowButton: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        // Bevel colors adapt to the effective appearance (light vs dark theme).
+        // Mac-native look: a subtle translucent rounded-rect "chip" (like a toolbar
+        // item), slightly stronger when pressed, with a faint hairline border.
         let isDark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-        let face: NSColor
-        let light: NSColor
-        let dark: NSColor
+        let fill: NSColor
         if isDark {
-            face = pressed ? NSColor(white: 0.22, alpha: 0.95) : NSColor(white: 0.32, alpha: 0.95)
-            light = NSColor(white: 0.55, alpha: 0.9)   // raised highlight
-            dark  = NSColor(white: 0.10, alpha: 0.9)   // raised shadow
+            fill = pressed ? NSColor(white: 1.0, alpha: 0.22) : NSColor(white: 1.0, alpha: 0.10)
         } else {
-            face = pressed ? NSColor(white: 0.78, alpha: 0.9) : NSColor(white: 0.86, alpha: 0.9)
-            light = NSColor.white.withAlphaComponent(0.9)
-            dark  = NSColor(white: 0.45, alpha: 0.9)
+            fill = pressed ? NSColor(white: 0.0, alpha: 0.14) : NSColor(white: 1.0, alpha: 0.55)
         }
-
-        let r = bounds.insetBy(dx: 0.5, dy: 0.5)
-        face.setFill()
-        NSBezierPath(rect: r).fill()
-
-        let topLeft = pressed ? dark : light
-        let bottomRight = pressed ? light : dark
-
-        topLeft.setStroke()
-        let tl = NSBezierPath()
-        tl.move(to: NSPoint(x: r.minX, y: r.minY)); tl.line(to: NSPoint(x: r.minX, y: r.maxY))
-        tl.line(to: NSPoint(x: r.maxX, y: r.maxY)); tl.lineWidth = 1; tl.stroke()
-
-        bottomRight.setStroke()
-        let br = NSBezierPath()
-        br.move(to: NSPoint(x: r.minX, y: r.minY)); br.line(to: NSPoint(x: r.maxX, y: r.minY))
-        br.line(to: NSPoint(x: r.maxX, y: r.maxY)); br.lineWidth = 1; br.stroke()
+        let r = bounds.insetBy(dx: 1, dy: 2)
+        let path = NSBezierPath(roundedRect: r, xRadius: 6, yRadius: 6)
+        fill.setFill()
+        path.fill()
+        NSColor.separatorColor.withAlphaComponent(0.6).setStroke()
+        path.lineWidth = 0.5
+        path.stroke()
     }
 }
 

@@ -1,0 +1,11 @@
+{
+  // This project does NOT use SwiftPM — the Command Line Tools' libPackageDescription
+  // is out of sync with swiftc, so `swift package` / `swift build` fail on the manifest
+  // (see CLAUDE.md). We build via ./build.sh (swiftc directly). Disable the VS Code
+  // Swift extension's automatic package operations so they stop erroring in the background.
+  "swift.backgroundCompilation": false,
+  "swift.disableAutoResolve": true,
+  "swift.autoGenerateLaunchConfigurations": false,
+  "swift.sourcekit-lsp.disable": false,
+  "swift.disableSwiftPMIntegration": true
+}

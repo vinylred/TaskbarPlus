@@ -13,6 +13,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var latestItems: [DockItem] = []
     private var latestWindows: [WindowInfo] = []
     private var latestDesktops: [String: String] = [:]   // display UUID -> "Desktop N"
+    private var fullscreen = false                        // a fullscreen app is frontmost
+
+    /// Hide all bars while a fullscreen app is frontmost; show them otherwise.
+    /// Use alphaValue (not orderOut/orderFront) — ordering fights the panels'
+    /// `.canJoinAllSpaces` behavior and left a bar stuck hidden after Space switches.
+    private func applyVisibility() {
+        for panel in panels.values {
+            panel.alphaValue = fullscreen ? 0 : 1
+            panel.ignoresMouseEvents = fullscreen   // don't eat clicks while hidden
+        }
+    }
 
     /// Panels are keyed by screen origin AND side, so a screen's two split panels
     /// (left/right) don't collide on one key.
@@ -95,6 +106,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         service.onDesktopChange = { [weak self] names in
             self?.latestDesktops = names
             self?.applyDesktopNames()
+        }
+        // Hide the bar entirely when a fullscreen app is frontmost (presentation,
+        // fullscreen video, etc.); show it again on exit.
+        service.onFullscreenChange = { [weak self] fullscreen in
+            self?.fullscreen = fullscreen
+            self?.applyVisibility()
         }
 
         // Recreate panels when displays change (plug/unplug, resolution).
@@ -211,6 +228,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if let name = desktopName(for: screen) {
             panel.updateDesktop(name)
         }
+        if fullscreen { panel.alphaValue = 0; panel.ignoresMouseEvents = true }  // stay hidden if created during fullscreen
         return panel
     }
 

@@ -89,17 +89,32 @@ cycling those three space modes.
   literal `"Main"`, not a UUID — match accordingly when mapping to `NSScreen`.
 - Panels are recreated on display/config change; they `close()` (with
   `isReleasedWhenClosed = false`) and remove observers in `deinit` so they don't leak.
-- **Switcher running off the RIGHT edge (recurring bug — fixed several times):** the
-  switcher/right zone is an `NSStackView` of fixed-width buttons whose intrinsic content
-  width can exceed the space available. The fix has TWO required parts together:
-  (1) the right zone's `trailing` is pinned to the panel's right edge at `.required`, AND
-  (2) it has a `.required` left FLOOR (`rightZone.leading >= leftZone.trailing + gap`) so
-  content shrinks/caps instead of overflowing; the per-button width constraints must be
-  *breakable* (`.defaultHigh`) so they yield. Do NOT let a `centerZone.centerX` pin or a
-  `.defaultHigh` no-overlap guard be the only thing positioning the right zone — that lets
-  it drift off-screen. `switcherAvailableWidth()` must return the real on-screen span
-  (screen − flanking zones − padding), never the full screen width. If the right zone's
-  rendered `frame.maxX` exceeds the panel width, this is the bug — check those constraints.
+- **⚠️ Switcher / Trash running off the RIGHT edge (recurring bug — wasted hours MULTIPLE
+  times). FIRST check the blur width, NOT the zone constraints.**
+
+  **STEP 1 — always do this first.** Log `contentView?.frame.width` next to the window's
+  `frame.width`. If they differ (seen: window `1512` but `contentView` `1681`), THAT is the
+  bug and nothing else matters yet. The `NSVisualEffectView` set as `contentView` has
+  `translatesAutoresizingMaskIntoConstraints = false`; with autolayout content and no
+  explicit size, AppKit grows the window's *content rect* to fit the content's intrinsic
+  width, so the layout canvas is wider than the visible window and the right zone (Trash) +
+  rightmost chips render in the clipped overflow region. Every zone/switcher constraint can
+  be individually satisfied — they're just measured against a too-wide canvas, which makes
+  it *look* like a switcher-overflow problem and sends you fiddling constraints for nothing.
+  **Fix:** a `.required` **constant** width (+ height) constraint on the blur
+  (`blurWidthConstraint`), its constant set to the panel width in `reposition()`. Pinning
+  the blur to its superview/themeFrame does NOT work (that grows with the content); only a
+  constant clamps it.
+
+  **STEP 2 — only if the blur width is already correct.** The layout model is dead simple:
+  the switcher is the ONLY variable-width element. Launcher + icons are fixed and pin LEFT;
+  Trash (others) is fixed and pins RIGHT; the switcher fills the gap between them — bounded
+  `.required` between `leftZone.trailing + gap` and `rightZone.leading − gap`, with a
+  `.defaultHigh` bias toward the configured align edge. The per-button width constraints
+  must be *breakable* (`.defaultHigh`) so chips compress instead of overflowing.
+  `switcherAvailableWidth()` must return the real on-screen span (screen − flanking zones −
+  padding), never the full screen width. Do NOT let a `centerZone.centerX` pin or a
+  `.defaultHigh` no-overlap guard be the only thing positioning the right zone — it drifts.
 
 ## Private APIs
 

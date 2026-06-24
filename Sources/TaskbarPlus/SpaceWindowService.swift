@@ -26,6 +26,11 @@ final class SpaceWindowService {
     var onDesktopChange: (([String: String]) -> Void)?
     private var lastDesktopNames: [String: String] = [:]
 
+    /// Called on the main thread when the current Space's fullscreen state changes
+    /// (true = a fullscreen app is frontmost → the bar should hide).
+    var onFullscreenChange: ((Bool) -> Void)?
+    private var lastFullscreen: Bool?
+
     /// Distinct app count from the last accepted window scan, used to detect the
     /// transient collapse to a single app during App Exposé / Mission Control.
     private var lastAppCount = 0
@@ -98,6 +103,14 @@ final class SpaceWindowService {
     func refreshNow() { refresh(immediate: true) }
 
     private func refresh(immediate: Bool = false) {
+        // Fullscreen detection runs first and unconditionally — even when the window
+        // scan would early-return — so the bar hides/shows promptly.
+        let fullscreen = currentSpaceIsFullscreen()
+        if fullscreen != lastFullscreen {
+            lastFullscreen = fullscreen
+            onFullscreenChange?(fullscreen)
+        }
+
         let windows = currentSpaceWindows()
 
         // App Exposé / Mission Control transiently collapses the on-screen window
@@ -272,6 +285,44 @@ final class SpaceWindowService {
               let idx = spaces.firstIndex(where: { spaceID(from: $0) == cid })
         else { return 0 }
         return idx + 1
+    }
+
+    /// Whether the current Space on any display is a fullscreen-app space (e.g. a
+    /// PowerPoint presentation or fullscreen video). macOS gives fullscreen apps a
+    /// dedicated space whose `type` is non-zero (0 = a normal user desktop), and the
+    /// space carries a `TileLayoutManager`/fullscreen marker. The bar hides in that case.
+    func currentSpaceIsFullscreen() -> Bool {
+        // 1) Native macOS fullscreen Spaces (fullscreen video, app green-button
+        //    fullscreen) → the current space's type is non-zero.
+        if let raw = CGSCopyManagedDisplaySpaces(cid),
+           let displays = (raw as NSArray) as? [[String: Any]] {
+            for display in displays {
+                guard let current = display["Current Space"] as? [String: Any] else { continue }
+                if let type = current["type"] as? Int, type != 0 { return true }
+                if current["TileLayoutManager"] != nil { return true }
+            }
+        }
+        // 2) App-level fullscreen that does NOT use a Space — e.g. a PowerPoint /
+        //    Keynote slideshow, which is just a regular-layer window sized to the full
+        //    screen at the origin. Detect any on-screen, layer-0 window from a regular
+        //    app whose bounds cover (essentially) an entire screen.
+        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let infoList = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]]
+        else { return false }
+        let screens = NSScreen.screens.map { $0.frame }
+        for info in infoList {
+            guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
+                  let b = info[kCGWindowBounds as String] as? [String: Any],
+                  let x = b["X"] as? Double, let y = b["Y"] as? Double,
+                  let w = b["Width"] as? Double, let h = b["Height"] as? Double else { continue }
+            // CGWindow bounds are top-left global; compare extent to each screen's size
+            // (allow a few px of slop for menu-bar/rounding).
+            if screens.contains(where: { abs($0.width - w) < 4 && abs($0.height - h) < 4 }) {
+                return true
+            }
+            _ = (x, y)
+        }
+        return false
     }
 
     /// The active space id on each display.
