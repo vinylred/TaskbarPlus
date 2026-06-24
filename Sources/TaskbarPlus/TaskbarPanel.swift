@@ -1025,6 +1025,7 @@ final class DockIconView: NSView {
 
     // Custom tooltip (the non-key bar panel can't use AppKit's built-in .toolTip).
     private var overBadge = false
+    private var hovered = false
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -1046,6 +1047,7 @@ final class DockIconView: NSView {
         let p = convert(event.locationInWindow, from: nil)
         overBadge = item.isRunning && badgeRect.insetBy(dx: -3, dy: -3).contains(p)
         TooltipWindow.shared.show(tooltipText(at: p), below: self, anchorRect: iconRect)
+        hovered = true; needsDisplay = true   // event-driven; no cost when idle
     }
 
     override func mouseMoved(with event: NSEvent) {
@@ -1059,6 +1061,7 @@ final class DockIconView: NSView {
 
     override func mouseExited(with event: NSEvent) {
         TooltipWindow.shared.hide()
+        hovered = false; needsDisplay = true
     }
 
     // The image view would otherwise swallow the click; route everything through here.
@@ -1086,6 +1089,19 @@ final class DockIconView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+
+        // Hover highlight: a rounded backing behind the icon, like the Dock's hover
+        // state. App icons are usually full-bleed, so a backing exactly the icon size
+        // is hidden — extend it slightly PAST the icon so a visible rounded halo/rim
+        // shows around it. Drawn before the imageView subview composites on top.
+        // Purely event-driven — only redraws on enter/exit.
+        if hovered {
+            let isDark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            (isDark ? NSColor(white: 1.0, alpha: 0.20) : NSColor(white: 0.0, alpha: 0.14)).setFill()
+            let halo = iconRect.insetBy(dx: -3, dy: -3)
+            NSBezierPath(roundedRect: halo, xRadius: 9, yRadius: 9).fill()
+        }
+
         guard item.isRunning else { return }
 
         // Running dot, centered along the bottom edge.
@@ -1132,6 +1148,7 @@ final class WindowButton: NSView {
     private let info: WindowInfo
     private weak var panel: TaskbarPanel?
     private var pressed = false
+    private var hovered = false
 
     init(info: WindowInfo, panel: TaskbarPanel, width: CGFloat) {
         self.info = info
@@ -1192,10 +1209,12 @@ final class WindowButton: NSView {
 
     override func mouseEntered(with event: NSEvent) {
         TooltipWindow.shared.show(info.displayTitle, below: self)   // immediate, like the Dock
+        hovered = true; needsDisplay = true   // event-driven; no cost when idle
     }
 
     override func mouseExited(with event: NSEvent) {
         TooltipWindow.shared.hide()
+        hovered = false; needsDisplay = true
     }
 
     private func setPressed(_ v: Bool) {
@@ -1233,12 +1252,19 @@ final class WindowButton: NSView {
     override func draw(_ dirtyRect: NSRect) {
         // Mac-native look: a subtle translucent rounded-rect "chip" (like a toolbar
         // item), slightly stronger when pressed, with a faint hairline border.
+        // Three intensities: idle → hovered → pressed. Hover is a clear, noticeable
+        // bump so the button under the cursor reads as "live" (like the Dock / a
+        // toolbar item). In light mode hover tints toward the accent for visibility.
         let isDark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
         let fill: NSColor
         if isDark {
-            fill = pressed ? NSColor(white: 1.0, alpha: 0.22) : NSColor(white: 1.0, alpha: 0.10)
+            fill = pressed ? NSColor(white: 1.0, alpha: 0.30)
+                 : hovered ? NSColor(white: 1.0, alpha: 0.24)
+                           : NSColor(white: 1.0, alpha: 0.10)
         } else {
-            fill = pressed ? NSColor(white: 0.0, alpha: 0.14) : NSColor(white: 1.0, alpha: 0.55)
+            fill = pressed ? NSColor(white: 0.0, alpha: 0.18)
+                 : hovered ? NSColor(white: 0.0, alpha: 0.10)
+                           : NSColor(white: 1.0, alpha: 0.55)
         }
         let r = bounds.insetBy(dx: 1, dy: 2)
         let path = NSBezierPath(roundedRect: r, xRadius: 6, yRadius: 6)
