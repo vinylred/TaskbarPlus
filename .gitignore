@@ -2,6 +2,7 @@
 .build/
 .build-direct/
 *.app/
+dist/
 
 # macOS
 .DS_Store
