@@ -45,6 +45,18 @@ final class TaskbarPanel: NSPanel {
     private let switcherRow2 = NSStackView()
     /// Grouped mode: a horizontal row of bordered per-desktop segment boxes.
     private let segmentRow = NSStackView()
+    /// Grouped mode: a single persistent underline that slides to the active group's
+    /// box (a tab-style selection indicator). Lives in the contentView, above the
+    /// segment row, so it can animate its frame across box positions.
+    private let activeIndicator = NSView()
+    /// The boxes of the last grouped layout, by desktop index, so we can position the
+    /// indicator and decide whether a Space switch is a pure slide (same boxes) or a
+    /// structural change (snap, no animation).
+    private var groupedBoxes: [Int: NSView] = [:]
+    private var lastIndicatorDesktops: [Int] = []
+    /// Width pin on the segment row so .fillEqually has the full switcher area to divide
+    /// equally among the group boxes (otherwise the row hugs content and boxes shrink-wrap).
+    private var segmentRowWidth: NSLayoutConstraint?
 
     /// The screen this bar lives on. Resolved fresh by frame on each reposition so
     /// it survives display reconfiguration.
@@ -123,9 +135,15 @@ final class TaskbarPanel: NSPanel {
         // Grouped-mode segment row (sibling of the two rows; only one is shown).
         segmentRow.orientation = .horizontal
         segmentRow.alignment = .top   // boxes share a top edge; the active underline hangs below
+        segmentRow.distribution = .fillEqually   // every group box gets equal width and fills the row
         segmentRow.spacing = 8
         segmentRow.isHidden = true
         switcherStack.addArrangedSubview(segmentRow)
+
+        // The sliding active-group indicator (manually framed, not in any stack).
+        activeIndicator.wantsLayer = true
+        activeIndicator.layer?.cornerRadius = 1.5
+        activeIndicator.isHidden = true
 
         // Three zones across the bar: left edge, center, right edge.
         let debugBorders = ProcessInfo.processInfo.environment["TBP_BORDERS"] != nil
@@ -394,8 +412,8 @@ final class TaskbarPanel: NSPanel {
         switcherExpandConstraints = []
 
         let expand = config.expand(for: .switcher)
-        // Split mode pins the switcher to the right, so its content right-aligns too.
-        let align = config.splitMode ? .right : config.align(for: .switcher)
+        // Follow the configured align in every mode (don't hard-code right for split).
+        let align = config.align(for: .switcher)
 
         switcherRow1.distribution = .fill
         switcherRow2.distribution = .fill
@@ -496,6 +514,8 @@ final class TaskbarPanel: NSPanel {
         switcherRow1.isHidden = false
         switcherRow2.isHidden = false
         segmentRow.isHidden = true
+        activeIndicator.isHidden = true   // only shown in grouped mode
+        lastIndicatorDesktops = []
 
         let avail = switcherAvailableWidth()
         let spacing = switcherRow1.spacing
@@ -594,17 +614,36 @@ final class TaskbarPanel: NSPanel {
         let segHeight = Self.barHeight - 14
 
         var newButtons: [WindowButton] = []
+        groupedBoxes = [:]
         for desk in activeDesktops {
             let deskWindows = windows.filter { $0.desktopIndex == desk }
-            let seg = makeSegment(windows: deskWindows, width: segWidth, height: segHeight,
-                                  isActive: desk == current, into: &newButtons)
+            let (seg, box) = makeSegment(windows: deskWindows, width: segWidth, height: segHeight,
+                                         into: &newButtons)
             segmentRow.addArrangedSubview(seg)
+            groupedBoxes[desk] = box
+        }
+        // Pin the segment row to the full switcher area so .fillEqually divides it equally
+        // among the boxes (content then centers within each full-width box per `align`).
+        let rowWidth = (n - 1) * segGap + n * segWidth   // == totalAvail when not floored to minSeg
+        if let c = segmentRowWidth { c.constant = rowWidth }
+        else {
+            let c = segmentRow.widthAnchor.constraint(equalToConstant: rowWidth)
+            c.priority = .defaultHigh
+            c.isActive = true
+            segmentRowWidth = c
         }
         reassembleZones()
 
         contentView?.layoutSubtreeIfNeeded()
+        // Slide the active-group indicator to the current desktop's box. Animate only
+        // when the set of boxes is unchanged (a pure desktop switch); snap otherwise
+        // (boxes were added/removed/reordered, so a slide would look wrong).
+        let animate = activeDesktops == lastIndicatorDesktops
+        lastIndicatorDesktops = activeDesktops
+        updateActiveIndicator(activeDesktop: current, animate: animate)
+
         if ProcessInfo.processInfo.environment["TBP_DEBUG"] != nil {
-            NSLog("GROUPED active=\(current) order=\(activeDesktops) panel=\(frame.size) avail=\(Int(switcherAvailableWidth())) segW=\(Int(segWidth))")
+            NSLog("GROUPED active=\(current) order=\(activeDesktops) avail=\(Int(switcherAvailableWidth())) segW=\(Int(segWidth))")
         }
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.18; ctx.allowsImplicitAnimation = true
@@ -612,10 +651,46 @@ final class TaskbarPanel: NSPanel {
         }
     }
 
+    /// Position (and optionally slide) the persistent active-group indicator under the
+    /// active desktop's box. The indicator lives in the contentView so it can animate
+    /// its frame across box positions independently of the stack-laid segment row.
+    private func updateActiveIndicator(activeDesktop: Int, animate: Bool) {
+        guard grouped, let blur = contentView, let box = groupedBoxes[activeDesktop] else {
+            activeIndicator.isHidden = true
+            return
+        }
+        if activeIndicator.superview !== blur {
+            activeIndicator.removeFromSuperview()
+            blur.addSubview(activeIndicator)
+        }
+        // Theme-aware color (CALayer cgColor is static, so set it each time).
+        let isDark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        activeIndicator.layer?.backgroundColor = (isDark ? NSColor.white : NSColor.black)
+            .withAlphaComponent(0.85).cgColor
+
+        // Target frame: centered under the box, half its width, 3pt tall, just below it.
+        let boxFrame = box.convert(box.bounds, to: blur)
+        let w = boxFrame.width * 0.5
+        let target = NSRect(x: boxFrame.midX - w / 2, y: boxFrame.minY - 5, width: w, height: 3)
+
+        activeIndicator.isHidden = false
+        if animate && activeIndicator.frame != .zero {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.22
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                ctx.allowsImplicitAnimation = true
+                activeIndicator.animator().frame = target
+            }
+        } else {
+            activeIndicator.frame = target   // snap (first show / structural change)
+        }
+    }
+
     /// A bordered box for one desktop, containing its windows across two inner rows.
-    /// The active desktop gets an underline BELOW the box so it's easy to spot at a glance.
+    /// Returns the wrapper segment and its inner box (the box is what the sliding active
+    /// indicator aligns to). The active indicator itself is positioned separately.
     private func makeSegment(windows: [WindowInfo], width: CGFloat, height: CGFloat,
-                             isActive: Bool, into newButtons: inout [WindowButton]) -> NSView {
+                             into newButtons: inout [WindowButton]) -> (segment: NSView, box: NSView) {
         let boxIsDark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
         let box = NSView()
         box.wantsLayer = true
@@ -628,24 +703,13 @@ final class TaskbarPanel: NSPanel {
         box.layer?.cornerRadius = 5
         box.translatesAutoresizingMaskIntoConstraints = false
 
-        // The active desktop gets an underline sitting OUTSIDE and just under the box
-        // (like a tab/segmented-control selection). Color follows the bar's theme —
-        // resolve the foreground color within our effectiveAppearance, since a CALayer's
-        // cgColor is static and won't otherwise adapt to light/dark.
-        var underline: NSView? = nil
-        if isActive {
-            let line = NSView()
-            line.wantsLayer = true
-            let isDark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-            line.layer?.backgroundColor = (isDark ? NSColor.white : NSColor.black)
-                .withAlphaComponent(0.85).cgColor
-            line.layer?.cornerRadius = 1.5
-            line.translatesAutoresizingMaskIntoConstraints = false
-            underline = line
-        }
+        // The active desktop's underline is NOT drawn here anymore — a single persistent
+        // `activeIndicator` view slides to the active box (see updateActiveIndicator), so
+        // it can animate across box positions on a desktop switch. We just leave room
+        // below the box for it via the segment wrapper.
 
-        // Wrap [box] + [underline] in a vertical container so the underline is genuinely
-        // BELOW the bordered box, not drawn inside it.
+        // Wrap the box in a container that reserves the underline strip below it, so all
+        // boxes (active or not) share the same top edge and height.
         let segment = NSView()
         segment.translatesAutoresizingMaskIntoConstraints = false
         segment.addSubview(box)
@@ -653,24 +717,13 @@ final class TaskbarPanel: NSPanel {
             box.topAnchor.constraint(equalTo: segment.topAnchor),
             box.leadingAnchor.constraint(equalTo: segment.leadingAnchor),
             box.trailingAnchor.constraint(equalTo: segment.trailingAnchor),
+            box.bottomAnchor.constraint(equalTo: segment.bottomAnchor, constant: -5),
         ])
-        if let line = underline {
-            segment.addSubview(line)
-            NSLayoutConstraint.activate([
-                line.topAnchor.constraint(equalTo: box.bottomAnchor, constant: 2),
-                line.centerXAnchor.constraint(equalTo: box.centerXAnchor),
-                line.heightAnchor.constraint(equalToConstant: 3),
-                line.widthAnchor.constraint(equalTo: box.widthAnchor, multiplier: 0.5),
-                line.bottomAnchor.constraint(equalTo: segment.bottomAnchor),
-            ])
-        } else {
-            box.bottomAnchor.constraint(equalTo: segment.bottomAnchor).isActive = true
-        }
 
-        // Align the windows within the box per the switcher's align (right in split
-        // mode, so they sit flush toward the right edge of the group).
+        // Align the windows within the box per the switcher's `align` config — in EVERY
+        // mode (don't hard-code right for split mode).
         let segAlign: NSLayoutConstraint.Attribute
-        switch (config.splitMode ? .right : config.align(for: .switcher)) {
+        switch config.align(for: .switcher) {
         case .left:   segAlign = .leading
         case .center: segAlign = .centerX
         case .right:  segAlign = .trailing
@@ -679,24 +732,35 @@ final class TaskbarPanel: NSPanel {
         inner.orientation = .vertical
         inner.alignment = segAlign
         inner.spacing = 3
+        // The inner stack hugs its content width (so centerX positioning is meaningful);
+        // don't let it stretch to fill the box.
+        inner.setContentHuggingPriority(.required, for: .horizontal)
         inner.translatesAutoresizingMaskIntoConstraints = false
         box.addSubview(inner)
+        // The segmentRow uses .fillEqually, which sets its own equal-width constraints,
+        // so this is only a low-priority hint (and must NOT fight fillEqually).
         let widthC = box.widthAnchor.constraint(equalToConstant: width)
-        widthC.priority = .defaultHigh   // yield rather than push the right zone off-screen
-        // Pin the inner stack to the box edge matching the alignment so the content
-        // actually hugs that side (right edge in split mode); the opposite edge is a
-        // loose bound.
+        widthC.priority = .defaultLow
+        // Make the inner stack FILL the box's width (pinned to both edges), and let its
+        // own `alignment` (set above from segAlign) position the chip rows within that
+        // full width — leading / centerX / trailing. This is robust: it doesn't depend on
+        // a content-sized centerX pin resolving against the right box width (which raced
+        // during the switcher's layout pass and left content off-center).
         var cons: [NSLayoutConstraint] = [
             widthC,
             box.heightAnchor.constraint(equalToConstant: height),
             inner.centerYAnchor.constraint(equalTo: box.centerYAnchor),
+            // Stay inside the box on both sides (loose), then position per align.
+            inner.leadingAnchor.constraint(greaterThanOrEqualTo: box.leadingAnchor, constant: 4),
+            inner.trailingAnchor.constraint(lessThanOrEqualTo: box.trailingAnchor, constant: -4),
         ]
-        if segAlign == .trailing {
-            cons.append(inner.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -4))
-            cons.append(inner.leadingAnchor.constraint(greaterThanOrEqualTo: box.leadingAnchor, constant: 4))
-        } else {
+        switch segAlign {
+        case .leading:
             cons.append(inner.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 4))
-            cons.append(inner.trailingAnchor.constraint(lessThanOrEqualTo: box.trailingAnchor, constant: -4))
+        case .trailing:
+            cons.append(inner.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -4))
+        default:   // .centerX
+            cons.append(inner.centerXAnchor.constraint(equalTo: box.centerXAnchor))
         }
         NSLayoutConstraint.activate(cons)
 
@@ -728,7 +792,7 @@ final class TaskbarPanel: NSPanel {
             newButtons.append(btn)
         }
         row2.isHidden = row2.arrangedSubviews.isEmpty
-        return segment
+        return (segment, box)
     }
 
     /// Width available to ONE switcher row, given the switcher's zone and the space
@@ -1303,6 +1367,10 @@ final class LauncherButton: NSView {
         button.target = self
         button.action = #selector(showMenu)
         button.translatesAutoresizingMaskIntoConstraints = false
+        // Never let the "Apps" title get squeezed to "…": resist compression and don't
+        // stretch. The launcher hugs this natural width.
+        button.setContentCompressionResistancePriority(.required, for: .horizontal)
+        button.setContentHuggingPriority(.required, for: .horizontal)
         addSubview(button)
 
         // The desktop label is a flat, borderless button — click toggles the mode.
