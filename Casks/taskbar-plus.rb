@@ -1,23 +1,21 @@
 # Homebrew Cask for Taskbar Plus.
 #
-# This belongs in a TAP repo named `homebrew-<name>` (e.g. github.com/<OWNER>/homebrew-tap),
+# This belongs in a TAP repo named `homebrew-tap` (github.com/vinylred/homebrew-tap),
 # under its `Casks/` directory. Users then install with:
 #
-#   brew install --cask <OWNER>/tap/taskbar-plus
+#   brew install --cask vinylred/tap/taskbar-plus
 #
 # Before publishing each release, update `version` and `sha256` (run:
 #   shasum -a 256 dist/TaskbarPlus-<version>.zip
 # ), and make sure the GitHub Release for that tag has the matching zip attached.
-#
-# Replace <OWNER> and <REPO> below with your GitHub username and repository name.
 cask "taskbar-plus" do
   version "1.2.2"
   sha256 "06209829241eb0f9e9d6e7d11573f3201768bb07ae1e8ce7481d7e5c1b2c2d04"
 
-  url "https://github.com/<OWNER>/<REPO>/releases/download/v#{version}/TaskbarPlus-#{version}.zip"
+  url "https://github.com/vinylred/TaskbarPlus/releases/download/v#{version}/TaskbarPlus-#{version}.zip"
   name "Taskbar Plus"
   desc "Windows-style taskbar and per-Space window switcher for macOS"
-  homepage "https://github.com/<OWNER>/<REPO>"
+  homepage "https://github.com/vinylred/TaskbarPlus"
 
   # The app is ad-hoc-signed (private frameworks + no hardened runtime → can't be
   # notarized). `auto_updates false` / no `livecheck` since releases are manual.

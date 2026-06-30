@@ -7,17 +7,17 @@ an optional Homebrew Cask for a one-command install.
 
 ## One-time setup
 
-1. Create a GitHub repo for the source (e.g. `github.com/<OWNER>/<REPO>`), add it as a
+1. Create a GitHub repo for the source (e.g. `github.com/vinylred/TaskbarPlus`), add it as a
    remote, and push `main` + tags:
    ```sh
-   git remote add origin git@github.com:<OWNER>/<REPO>.git
+   git remote add origin git@github.com:vinylred/TaskbarPlus.git
    git push -u origin main
    git push --tags
    ```
 2. (For Cask) create a second repo named `homebrew-tap` and copy `Casks/taskbar-plus.rb`
    into its `Casks/` directory. Users then install with:
    ```sh
-   brew install --cask <OWNER>/tap/taskbar-plus
+   brew install --cask vinylred/tap/taskbar-plus
    ```
 
 ## Each release
@@ -28,7 +28,7 @@ an optional Homebrew Cask for a one-command install.
 ```
 Then:
 1. Create a GitHub Release for the tag (e.g. `v1.2.2`) and **attach the zip**.
-2. Update `version` and `sha256` in `Casks/taskbar-plus.rb`, and `<OWNER>/<REPO>` in its
+2. Update `version` and `sha256` in `Casks/taskbar-plus.rb`, and `vinylred/TaskbarPlus` in its
    URLs. Commit/push the tap repo.
 
 Bump the version in `Resources/Info.plist` before tagging so the app, tag, and zip name
@@ -39,7 +39,7 @@ all agree.
 See [README.md](README.md). Either:
 - **Manual:** download the zip, move to /Applications, run
   `xattr -dr com.apple.quarantine /Applications/TaskbarPlus.app`, open, grant permissions.
-- **Homebrew:** `brew install --cask <OWNER>/tap/taskbar-plus` (handles the move + clears
+- **Homebrew:** `brew install --cask vinylred/tap/taskbar-plus` (handles the move + clears
   quarantine automatically), then grant permissions.
 
 ## What CANNOT be automated
