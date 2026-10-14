@@ -306,14 +306,27 @@ final class SpaceWindowService {
         return result
     }
 
-    /// Whether a window lives on a Space other than a currently-visible one.
-    /// (macOS 26 blocks programmatic Space switching, so a cross-Space click posts the
-    /// Ctrl+N shortcut first — see DesktopSwitcher — this tells the panel which path.)
+    /// Whether a window lives on a Space other than a currently-visible one (per this
+    /// refresh's layout snapshot). Windows on no Space (minimized) count as visible.
     func isWindowOnOtherSpace(_ windowNumber: Int) -> Bool {
         let target = spaceIDs(forWindowNumbers: [windowNumber])
-        guard !target.isEmpty else { return false }
-        let current = snapshotLayout().currentSpaceIDs   // fresh: called on click
-        return !target.contains(where: { current.contains($0) })
+        return !target.isEmpty && !target.contains(where: { layout.currentSpaceIDs.contains($0) })
+    }
+
+    /// If the window is on a Space that isn't showing, start switching to it and
+    /// return how long until it's visible; nil if it's already visible, on no Space
+    /// (minimized), or unreachable. Fresh snapshot: called on click.
+    func switchToSpace(ofWindow windowNumber: Int) -> TimeInterval? {
+        let layout = snapshotLayout()
+        let ids = spaceIDs(forWindowNumbers: [windowNumber])
+        guard !ids.isEmpty, !ids.contains(where: { layout.currentSpaceIDs.contains($0) }),
+              let target = ids.first(where: { id in layout.displays.contains { $0.spaces.contains { $0.id == id } } })
+        else { return nil }
+        // Keyboard Space switching acts on the display under the mouse — the user
+        // just clicked the bar there.
+        let mouse = NSEvent.mouseLocation
+        let activeScreen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }?.key
+        return DesktopSwitcher.go(layout.routes(to: target, activeScreenKey: activeScreen))
     }
 
     /// One CGSCopyManagedDisplaySpaces call mapped onto the current screens.

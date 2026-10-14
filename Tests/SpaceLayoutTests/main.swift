@@ -86,5 +86,33 @@ do {
     check(l.currentSpaceIDs, [], "garbage → no current")
 }
 
+// 8. Routes to a Space.
+do {
+    typealias R = SpaceLayout.Route
+    // One display: [D1, D2, F(5), D3]; on D1.
+    let one = SpaceLayout(raw: [display("UUID-A", [space(1), space(2), space(5, fullscreen: true), space(3)], current: 1)],
+                          screens: [main])
+    check(one.routes(to: 3, activeScreenKey: main.key), [R(jump: 3, arrows: 0), R(jump: nil, arrows: 3)],
+          "desktop: jump first, arrows as fallback")
+    check(one.routes(to: 5, activeScreenKey: main.key).first, R(jump: nil, arrows: 2), "fullscreen: arrow right twice from D1")
+    check(one.routes(to: 5, activeScreenKey: main.key).last, R(jump: 2, arrows: 1), "fullscreen fallback: jump to nearest desktop, then arrow")
+    // Two displays; target fullscreen Space on the external, mouse on main.
+    let a = display("UUID-A", [space(1), space(2)], current: 1)
+    let b = display("UUID-B", [space(10), space(11, fullscreen: true), space(12)], current: 12)
+    let two = SpaceLayout(raw: [a, b], screens: [main, ext])
+    check(two.routes(to: 11, activeScreenKey: main.key), [R(jump: 3, arrows: 1)],
+          "other display: jump to its nearest desktop first (moves focus), then arrow")
+    check(two.routes(to: 11, activeScreenKey: ext.key).first, R(jump: nil, arrows: -1),
+          "same display: arrow left from current")
+    check(two.routes(to: 99, activeScreenKey: main.key), [], "unknown Space → no route")
+}
+
+// 9. Update version comparison.
+check(Updater.isNewer("1.3.2", than: "1.3.1"), true, "patch bump")
+check(Updater.isNewer("1.10.0", than: "1.9.9"), true, "numeric, not lexical")
+check(Updater.isNewer("1.3", than: "1.3.0"), false, "missing component = 0")
+check(Updater.isNewer("1.3.1", than: "1.3.1"), false, "same version")
+check(Updater.isNewer("1.2.9", than: "1.3.0"), false, "older")
+
 print(failures == 0 ? "All SpaceLayout tests passed." : "\(failures) failure(s).")
 exit(failures == 0 ? 0 : 1)

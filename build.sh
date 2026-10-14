@@ -45,6 +45,7 @@ swiftc \
     Sources/TaskbarPlus/SpaceWindowService.swift \
     Sources/TaskbarPlus/SystemShortcut.swift \
     Sources/TaskbarPlus/TaskbarPanel.swift \
+    Sources/TaskbarPlus/Updater.swift \
     Sources/TaskbarPlus/main.swift \
     -o "${BUILD_DIR}/${APP_NAME}"
 

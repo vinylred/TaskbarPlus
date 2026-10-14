@@ -81,6 +81,10 @@ Settings are in the menu-bar icon → **Preferences**:
 - **Monitors** — main monitor only, or every monitor.
 - **Theme** — auto, light or dark.
 - **Start at login.**
+- **Install updates automatically** — on by default. Taskbar Plus checks GitHub Releases
+  daily, verifies the download is signed like the installed app, swaps it in and
+  relaunches (permissions carry over). Menu-bar → *Check for Updates…* checks now.
+  (Self-update only works when the app is in an Applications folder.)
 
 They're persisted to `~/.taskbarplus.json`. Maximised windows are automatically
 shortened to stop at the bar's top edge (needs Accessibility permission).

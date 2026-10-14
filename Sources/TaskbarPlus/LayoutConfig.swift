@@ -54,7 +54,7 @@ enum Section: String, CaseIterable {
 
 /// User settings, persisted in ~/.taskbarplus.json:
 ///   { "taskbarOnly": false, "spaceMode": "currentSpace", "groupByApp": false, "compact": false,
-///     "monitors": "dock", "theme": "auto" }
+///     "monitors": "dock", "theme": "auto", "autoUpdate": true }
 /// The bar's layout itself is fixed (`zones`) — not user-configurable. Unknown
 /// keys (e.g. per-section placements from older versions) are ignored; a missing or
 /// invalid file falls back to defaults.
@@ -69,6 +69,8 @@ struct LayoutConfig {
     var groupByApp: Bool = false
     /// One-row (shorter) bar instead of the standard two-row bar.
     var compact: Bool = false
+    /// Install new releases automatically (see Updater).
+    var autoUpdate: Bool = true
 
     /// The one built-in layout, Windows-style: Start + app icons on the left, window
     /// buttons in the middle (expanding to fill the gap — see
@@ -94,8 +96,10 @@ struct LayoutConfig {
         let taskbarOnly = (raw["taskbarOnly"] as? Bool) ?? (raw["splitMode"] as? Bool) ?? false
         let groupByApp = (raw["groupByApp"] as? Bool) ?? false
         let compact = (raw["compact"] as? Bool) ?? false
+        let autoUpdate = (raw["autoUpdate"] as? Bool) ?? true
         return LayoutConfig(monitors: monitors, theme: theme, spaceMode: spaceMode,
-                            taskbarOnly: taskbarOnly, groupByApp: groupByApp, compact: compact)
+                            taskbarOnly: taskbarOnly, groupByApp: groupByApp, compact: compact,
+                            autoUpdate: autoUpdate)
     }
 
     /// Zone a section renders in. In taskbar-only mode the switcher moves to the right
@@ -117,7 +121,7 @@ struct LayoutConfig {
         let root: [String: Any] = [
             "monitors": monitors.rawValue, "theme": theme.rawValue,
             "spaceMode": spaceMode.rawValue, "taskbarOnly": taskbarOnly, "groupByApp": groupByApp,
-            "compact": compact,
+            "compact": compact, "autoUpdate": autoUpdate,
         ]
         if let data = try? JSONSerialization.data(
             withJSONObject: root, options: [.prettyPrinted, .sortedKeys]) {

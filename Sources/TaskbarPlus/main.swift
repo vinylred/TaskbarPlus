@@ -8,6 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var prefs: PreferencesController?
     private var statusItem: NSStatusItem?
     private let permissions = Permissions()
+    private let updater = Updater()
 
     /// One panel per target screen, keyed by `NSScreen.key` (its frame origin;
     /// CGPoint isn't Hashable before macOS 15).
@@ -119,6 +120,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // (launch alert, ⚠︎ menu-bar icon, menu items). See Permissions.
         permissions.onChange = { [weak self] in self?.updateStatusIcon() }
         permissions.start()
+        updater.automatic = { [weak self] in self?.config.autoUpdate ?? true }
+        updater.start()
         DesktopSwitcher.ensureShortcutsEnabled()   // Ctrl+N desktop shortcuts for cross-space clicks
         service.spaceMode = config.spaceMode   // restore persisted mode
         dockModel.taskbarOnly = config.taskbarOnly // taskbar-only mode hides Dock-provided sections
@@ -154,7 +157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        menu.addItem(NSMenuItem(title: "Taskbar Plus", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Taskbar Plus \(Updater.currentVersion)", action: nil, keyEquivalent: ""))
         menu.addItem(.separator())
         // Each missing permission: what's broken (disabled line) + a one-click Fix.
         for kind in permissions.missing {
@@ -176,6 +179,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let prefItem = NSMenuItem(title: "Preferences…", action: #selector(openPreferences), keyEquivalent: ",")
         prefItem.target = self
         menu.addItem(prefItem)
+        let update = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
+        update.target = self
+        menu.addItem(update)
         let diag = NSMenuItem(title: "Copy Diagnostics", action: #selector(copyDiagnostics), keyEquivalent: "")
         diag.target = self
         diag.toolTip = "Copies the screen / Spaces / window layout (no window titles) for a bug report."
@@ -191,6 +197,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func restartApp() { permissions.relaunch() }
+
+    @objc private func checkForUpdates() { updater.check(userInitiated: true) }
 
     /// Bug-report snapshot to the clipboard: versions, settings, permissions, screens,
     /// the Spaces layout as the app sees it, and the switcher's windows (app names
@@ -280,8 +288,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let panel = TaskbarPanel(screen: screen, config: config)
         panel.onCloseRequested = { [weak self] in self?.service.refreshNow() }
         panel.onToggleSpaceMode = { [weak self] in self?.toggleSpaceMode() }
-        panel.onIsWindowOnOtherSpace = { [weak self] num in
-            self?.service.isWindowOnOtherSpace(num) ?? false
+        panel.onSwitchToWindowSpace = { [weak self] num in
+            self?.service.switchToSpace(ofWindow: num)
         }
         // Each bar's own screen's current desktop (displays have separate Spaces).
         let origin = screen.frame.origin

@@ -119,6 +119,19 @@ expanding to fill the middle, folders + Trash right).
   (symbolichotkeys 118+N−1), not a hard-coded Ctrl+N; if it's disabled the click just
   raises/activates.
 
+## Auto-update (`Updater`)
+
+Checks `releases/latest` 30s after launch and daily; downloads `TaskbarPlus-<v>.zip`,
+verifies the new bundle satisfies the RUNNING app's designated requirement (identifier +
+signing-cert leaf), swaps it in via a detached shell script after exit, relaunches. Only
+when running from an `…/Applications` folder (never overwrites a dev build).
+- ⚠️ **Every release must be signed with the same "TaskbarPlus Dev" certificate** (only in
+  this machine's login keychain). A release signed with anything else is rejected by every
+  installed copy — users would have to reinstall manually. **Back the identity up**
+  (Keychain Access → export "TaskbarPlus Dev" as .p12) and never ship ad-hoc builds.
+- Copies older than 1.3.2 have no updater — one manual install required.
+- Release assets must keep the name `TaskbarPlus-<version>.zip` and tags `v<version>`.
+
 ## Maximised windows
 
 macOS only reserves space for its own Dock/menu bar, so `WindowFitter` (driven by

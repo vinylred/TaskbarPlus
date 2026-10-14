@@ -835,17 +835,19 @@ final class TaskbarPanel: NSPanel {
     private func dockStacks() -> [NSStackView] { [pinnedStack, runningStack, othersStack] }
 
     /// Returns true if the window is on a Space other than a currently-visible one.
-    var onIsWindowOnOtherSpace: ((Int) -> Bool)?
+    /// If the window is on a Space that isn't showing, start switching there and
+    /// return how long until it's visible; nil if it's already visible (or unreachable).
+    var onSwitchToWindowSpace: ((Int) -> TimeInterval?)?
 
     /// Raise a specific window (task-switcher click).
     func raiseWindow(_ info: WindowInfo) {
-        let onOther = onIsWindowOnOtherSpace?(info.windowNumber) ?? false
-        // The private Space-switch APIs are dead on macOS 26, but synthesizing the
-        // "switch to Desktop N" shortcut (Ctrl+N) still works. Switch to the window's
-        // desktop, then raise it once it's on-screen (AX can only see windows on the
-        // current Space). If that shortcut is off/missing, just raise (activates the app).
-        if onOther, info.desktopIndex >= 1, DesktopSwitcher.switchTo(desktop: info.desktopIndex) {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+        // A window on another Space (another desktop, or a fullscreen app's own Space)
+        // is invisible to AX, and activating its app may just front one of the app's
+        // windows HERE instead. So switch to the window's Space first (synthesized
+        // shortcuts — see DesktopSwitcher), then raise that exact window once it's
+        // on-screen. If no route is possible, just raise (activates the app).
+        if let delay = onSwitchToWindowSpace?(info.windowNumber) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 WindowControl.raise(windowNumber: info.windowNumber, pid: info.pid, title: info.title)
             }
         } else {

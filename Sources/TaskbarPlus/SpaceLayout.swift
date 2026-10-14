@@ -106,6 +106,43 @@ struct SpaceLayout {
         ids.compactMap { desktopNumbers[$0] }.min() ?? 0
     }
 
+    /// One way to get to a Space with synthesized system shortcuts: optionally jump to
+    /// desktop `jump` ("Switch to Desktop N", which also moves focus to that desktop's
+    /// display), then press "Move right/left a space" `arrows` times (positive =
+    /// right). Mission Control orders each display's Spaces left→right as listed.
+    struct Route: Equatable {
+        var jump: Int?
+        var arrows: Int
+    }
+
+    /// Ways to reach Space `target`, best first; the caller runs the first one whose
+    /// shortcuts are enabled. `activeScreenKey` is the screen keyboard Space switching
+    /// acts on (the one under the mouse — the user just clicked the bar there).
+    /// - A desktop with a number: jump straight to it.
+    /// - Otherwise (fullscreen-app / split-view Space): arrow over from the current
+    ///   Space if it's on the active display; if it's on another display, first jump to
+    ///   the nearest numbered desktop there (moving focus to that display), then arrow.
+    func routes(to target: UInt64, activeScreenKey: String?) -> [Route] {
+        guard let display = displays.first(where: { d in d.spaces.contains { $0.id == target } }),
+              let targetIndex = display.spaces.firstIndex(where: { $0.id == target }) else { return [] }
+        var result: [Route] = []
+        if let n = desktopNumbers[target] { result.append(Route(jump: n, arrows: 0)) }
+        let onActiveDisplay = activeScreenKey.map { display.screenKeys.contains($0) } ?? (displays.count == 1)
+        let anchors = display.spaces.indices
+            .filter { desktopNumbers[display.spaces[$0].id] != nil }
+            .sorted { abs($0 - targetIndex) < abs($1 - targetIndex) }
+        if onActiveDisplay || displays.count == 1,
+           let current = display.currentSpace,
+           let currentIndex = display.spaces.firstIndex(where: { $0.id == current }) {
+            result.append(Route(jump: nil, arrows: targetIndex - currentIndex))
+        }
+        if let a = anchors.first, let n = desktopNumbers[display.spaces[a].id] {
+            let r = Route(jump: n, arrows: targetIndex - a)
+            if !result.contains(r) { result.append(r) }
+        }
+        return result
+    }
+
     static func spaceID(from dict: [String: Any]) -> UInt64? {
         if let n = dict["ManagedSpaceID"] as? NSNumber { return n.uint64Value }
         if let n = dict["id64"] as? NSNumber { return n.uint64Value }

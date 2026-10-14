@@ -15,6 +15,7 @@ final class PreferencesController: NSObject {
     private var themePicker: NSSegmentedControl!
     private var groupByAppCheckbox: NSButton!
     private var loginCheckbox: NSButton!
+    private var autoUpdateCheckbox: NSButton!
 
     private static let spaceModes: [SpaceMode] = [.currentSpace, .allSpaces, .grouped]
     private static let themes: [Theme] = [.auto, .light, .dark]
@@ -25,8 +26,9 @@ final class PreferencesController: NSObject {
 
         let width: CGFloat = 480
         let rowH: CGFloat = 40
-        // Dock + Height + Windows shown + Group by app + Monitors + Theme + Startup rows.
-        let height = 7 * rowH + 30
+        // Dock + Height + Windows shown + Group by app + Monitors + Theme + Startup +
+        // Updates rows.
+        let height = 8 * rowH + 30
 
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
@@ -104,6 +106,14 @@ final class PreferencesController: NSObject {
         content.addSubview(login)
         loginCheckbox = login
 
+        y -= rowH
+        let update = NSButton(checkboxWithTitle: "Install updates automatically",
+                              target: self, action: #selector(changed))
+        update.frame = NSRect(x: 133, y: y - 2, width: 300, height: 24)
+        update.state = config.autoUpdate ? .on : .off
+        content.addSubview(update)
+        autoUpdateCheckbox = update
+
         window.contentView = content
     }
 
@@ -121,7 +131,8 @@ final class PreferencesController: NSObject {
             spaceMode: Self.spaceModes[spaceModePicker.selectedSegment],
             taskbarOnly: dockPicker.selectedSegment == 1,
             groupByApp: groupByAppCheckbox.state == .on,
-            compact: heightPicker.selectedSegment == 1)
+            compact: heightPicker.selectedSegment == 1,
+            autoUpdate: autoUpdateCheckbox.state == .on)
         onChange(config)
     }
 }

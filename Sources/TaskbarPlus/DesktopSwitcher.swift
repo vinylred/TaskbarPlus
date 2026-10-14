@@ -1,11 +1,12 @@
 import CoreGraphics
 import Foundation
 
-/// Switches macOS Spaces by synthesizing the "switch to Desktop N" keyboard
-/// shortcut (Ctrl+N). This is the only mechanism that still works on macOS 26 —
-/// the private CGS/SLS space-switch APIs were disabled (same lockdown that broke
-/// yabai). Requires the Ctrl+Number shortcuts to be enabled in System Settings,
-/// which `ensureShortcutsEnabled()` does once.
+/// Switches macOS Spaces by synthesizing system shortcuts: "Switch to Desktop N"
+/// (⌃N) for numbered desktops, and "Move left/right a space" (⌃← / ⌃→) to step onto
+/// fullscreen-app Spaces, which have no number. This is the only mechanism that still
+/// works on macOS 26 — the private CGS/SLS space-switch APIs, and making a window on
+/// another Space key via SLPS, are no-ops (same lockdown that broke yabai). Requires
+/// the shortcuts to be enabled, which `ensureShortcutsEnabled()` does once for ⌃1…9.
 enum DesktopSwitcher {
 
     /// macOS virtual key codes for the number row 1…9 (the default Ctrl+N bindings).
@@ -22,10 +23,48 @@ enum DesktopSwitcher {
     /// nothing) if that shortcut is disabled or doesn't exist.
     @discardableResult
     static func switchTo(desktop index: Int) -> Bool {
-        guard index >= 1, index <= maxDesktop else { return false }
+        guard let b = desktopBinding(index) else { return false }
+        return SystemShortcut.post(firstHotkeyID + index - 1, defaultBinding: b)
+    }
+
+    private static func desktopBinding(_ index: Int) -> SystemShortcut.Binding? {
+        guard index >= 1, index <= maxDesktop else { return nil }
         let stock = index <= numberKeyCodes.count
             ? (key: numberKeyCodes[index - 1], flags: CGEventFlags.maskControl) : nil
-        return SystemShortcut.post(firstHotkeyID + index - 1, defaultBinding: stock)
+        return SystemShortcut.binding(firstHotkeyID + index - 1, defaultBinding: stock)
+    }
+
+    private static func arrowBinding(right: Bool) -> SystemShortcut.Binding? {
+        right ? SystemShortcut.binding(SystemShortcut.moveRightSpace, defaultBinding: SystemShortcut.defaultMoveRight)
+              : SystemShortcut.binding(SystemShortcut.moveLeftSpace, defaultBinding: SystemShortcut.defaultMoveLeft)
+    }
+
+    /// Time to let a Space-switch animation finish before the next step / the raise.
+    private static let step: TimeInterval = 0.45
+
+    /// Run the first route (see `SpaceLayout.routes`) whose shortcuts are enabled.
+    /// Returns how long until the target Space is showing (raise the window after
+    /// that), or nil if no route is possible.
+    static func go(_ routes: [SpaceLayout.Route]) -> TimeInterval? {
+        guard let route = routes.first(where: { r in
+            (r.jump.map { desktopBinding($0) != nil } ?? true)
+                && (r.arrows == 0 || arrowBinding(right: r.arrows > 0) != nil)
+        }) else { return nil }
+        var t: TimeInterval = 0
+        if let n = route.jump {
+            switchTo(desktop: n)
+            t += step
+        }
+        let right = route.arrows > 0
+        for _ in 0..<abs(route.arrows) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + t) {
+                let id = right ? SystemShortcut.moveRightSpace : SystemShortcut.moveLeftSpace
+                SystemShortcut.post(id, defaultBinding: right ? SystemShortcut.defaultMoveRight
+                                                              : SystemShortcut.defaultMoveLeft)
+            }
+            t += step
+        }
+        return max(t, step)
     }
 
     /// Make sure "Switch to Desktop 1…9" (Ctrl+1…9) are on in System Settings, so the
