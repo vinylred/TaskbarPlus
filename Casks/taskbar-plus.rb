@@ -9,8 +9,8 @@
 #   shasum -a 256 dist/TaskbarPlus-<version>.zip
 # ), and make sure the GitHub Release for that tag has the matching zip attached.
 cask "taskbar-plus" do
-  version "1.2.2"
-  sha256 "06209829241eb0f9e9d6e7d11573f3201768bb07ae1e8ce7481d7e5c1b2c2d04"
+  version "1.3.0"
+  sha256 "fe679c012be0a8a95a7a2f3963b0e0f91c685b15b8536a99fa2b9c738726a591"
 
   url "https://github.com/vinylred/TaskbarPlus/releases/download/v#{version}/TaskbarPlus-#{version}.zip"
   name "Taskbar Plus"
