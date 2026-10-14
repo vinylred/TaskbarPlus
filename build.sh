@@ -36,10 +36,12 @@ swiftc \
     Sources/TaskbarPlus/DesktopSwitcher.swift \
     Sources/TaskbarPlus/LayoutConfig.swift \
     Sources/TaskbarPlus/LoginItem.swift \
+    Sources/TaskbarPlus/Permissions.swift \
     Sources/TaskbarPlus/PreferencesController.swift \
     Sources/TaskbarPlus/WindowInfo.swift \
     Sources/TaskbarPlus/WindowControl.swift \
     Sources/TaskbarPlus/WindowFitter.swift \
+    Sources/TaskbarPlus/SpaceLayout.swift \
     Sources/TaskbarPlus/SpaceWindowService.swift \
     Sources/TaskbarPlus/SystemShortcut.swift \
     Sources/TaskbarPlus/TaskbarPanel.swift \

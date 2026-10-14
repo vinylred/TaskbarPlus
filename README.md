@@ -33,13 +33,21 @@ agent (no Dock icon of its own).
    open /Applications/TaskbarPlus.app
    ```
 
-5. **Grant permissions** when prompted (System Settings → Privacy & Security):
-   - **Accessibility** — to raise/close specific windows from the switcher.
+5. **Grant permissions.** On first launch Taskbar Plus explains what it needs and offers
+   **Fix…**, which opens the right System Settings page — just switch Taskbar Plus on:
+   - **Accessibility** — to fit maximised windows above the bar and raise/close specific
+     windows from the switcher.
    - **Screen Recording** — to read window *titles*. (The bar still works without it,
      showing app names instead of titles.)
 
-   After granting, quit and reopen the app (or toggle it off/on in the permission list)
-   so the grants take effect.
+   While a permission is missing, the menu-bar icon shows **⚠︎** and its menu has a
+   **Fix…** item for it, plus **Restart Taskbar Plus** (Screen Recording only applies
+   after a restart).
+
+   **Upgrading and something stopped working?** macOS ties permissions to the app's
+   signature, so after an upgrade Taskbar Plus can look switched *on* in System Settings
+   while the grant no longer applies. Use **Fix…** from the menu-bar icon — it clears the
+   stale entry so you can switch it on again.
 
 6. **(Optional) Start at login:** open Preferences from the menu-bar icon and enable
    *Start at login*.

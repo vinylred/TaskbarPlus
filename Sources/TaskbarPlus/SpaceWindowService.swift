@@ -21,8 +21,8 @@ final class SpaceWindowService {
     /// Spaces per `spaceMode`), in stable creation order.
     var onWindowsChange: (([WindowInfo]) -> Void)?
 
-    /// Called on the main thread with the per-display desktop labels (keyed by
-    /// display UUID) when any of them change.
+    /// Called on the main thread with each screen's desktop label (keyed by
+    /// `NSScreen.key`) when any of them change.
     var onDesktopChange: (([String: String]) -> Void)?
     private var lastDesktopNames: [String: String] = [:]
 
@@ -61,6 +61,8 @@ final class SpaceWindowService {
     /// windows an app keeps alive off-screen (e.g. Notes' main window — skip). AX
     /// tells them apart; the verdict is cached per window while it stays off-screen.
     private var liveOffscreen: [Int: Bool] = [:]
+    /// Spaces layout, re-snapshotted at the start of every refresh (one CGS call).
+    private(set) var layout = SpaceLayout(raw: [], screens: [])
 
     private var debounceTimer: Timer?
     private var safetyPoll: Timer?
@@ -117,6 +119,7 @@ final class SpaceWindowService {
     private func refresh(immediate: Bool = false) {
         // Fullscreen detection runs first and unconditionally — even when the window
         // scan would early-return — so the bar hides/shows promptly.
+        layout = snapshotLayout()
         let fullscreen = fullscreenScreens()
         if fullscreen != lastFullscreen {
             lastFullscreen = fullscreen
@@ -152,7 +155,7 @@ final class SpaceWindowService {
 
         if ProcessInfo.processInfo.environment["TBP_DEBUG"] != nil {
             let mode = detected == nil ? "FALLBACK(all-apps)" : "current-space"
-            NSLog("TaskbarPlus[\(mode)] spaces=\(currentSpaceIDs().sorted()) apps=\(apps.map { $0.localizedName ?? "?" }) windows=\(orderedWindows.count)")
+            NSLog("TaskbarPlus[\(mode)] spaces=\(layout.currentSpaceIDs.sorted()) fullscreen=\(fullscreen.sorted()) displays=\(layout.displays.map { "\($0.identifier ?? "?")→\($0.screenKeys) cur=\($0.currentSpace ?? 0) fs=\($0.showsFullscreen) spaces=\($0.spaces.map { "\($0.id)\($0.isDesktop ? "" : "F")" })" }) apps=\(apps.map { $0.localizedName ?? "?" }) windows=\(orderedWindows.count)")
         }
         // Only emit when the payload actually changed — the 0.5s poll otherwise drives
         // a full Dock-model rebuild + view diff twice a second at idle. (A Space switch
@@ -167,7 +170,9 @@ final class SpaceWindowService {
         // Include every display's current desktop so a Space switch (on any display)
         // still re-emits even when the window set is identical (grouped mode moves the
         // active-desktop indicator).
-        let desktops = currentDesktopNames()
+        // Each screen's label ("Desk N"), keyed by NSScreen.key.
+        let desktops = Dictionary(NSScreen.screens.map { ($0.key, layout.label(onScreen: $0.key)) },
+                                  uniquingKeysWith: { a, _ in a })
         let desktopsSig = desktops.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ",")
         let winSig = "\(desktopsSig)|" + orderedWindows.map { "\($0.windowNumber):\($0.displayTitle):\($0.desktopIndex)" }.joined(separator: "|")
         if winSig != lastWindowsSignature {
@@ -191,7 +196,8 @@ final class SpaceWindowService {
     private func currentSpaceWindows() -> [WindowInfo]? {
         // Both all-spaces and grouped modes enumerate every Space's windows.
         let allSpaces = (spaceMode == .allSpaces || spaceMode == .grouped)
-        let currentSpaces = currentSpaceIDs()
+        let currentSpaces = layout.currentSpaceIDs
+        let fullscreenSpaces = layout.fullscreenSpaceIDs
         guard allSpaces || !currentSpaces.isEmpty else { return nil }
 
         // Enumerate ALL windows (not `.optionOnScreenOnly`), even in currentSpace mode:
@@ -259,7 +265,6 @@ final class SpaceWindowService {
         // Desktop index per window (for grouping and the click → switch-to-its-desktop
         // chain), and the current-Space filter in currentSpace mode — both need the
         // window's Space ids.
-        let spaceIndex = allSpaces ? spaceIDToDesktopIndex() : [:]
 
         var icons: [pid_t: NSImage] = [:]
         var result: [WindowInfo] = []
@@ -275,8 +280,11 @@ final class SpaceWindowService {
                 liveOffscreen[r.num] = live
                 if !live { continue }
             }
-            // currentSpace mode: keep windows on a visible Space, plus minimized ones.
-            if !allSpaces, !noSpace, !ids.contains(where: { currentSpaces.contains($0) }) { continue }
+            // currentSpace mode: keep windows on a visible Space, minimized ones, and
+            // fullscreen apps — each sits on its own Space, so it would otherwise drop off
+            // the bar (unreachable but via Mission Control) as soon as you leave it.
+            if !allSpaces, !noSpace, !ids.contains(where: { currentSpaces.contains($0) }),
+               !ids.contains(where: { fullscreenSpaces.contains($0) }) { continue }
             let icon = icons[r.pid] ?? {
                 let img = NSRunningApplication(processIdentifier: r.pid)?.icon
                     ?? NSImage(named: NSImage.applicationIconName) ?? NSImage()
@@ -291,7 +299,7 @@ final class SpaceWindowService {
                 // onto — the current one of their screen — not the "other" box.
                 info.desktopIndex = noSpace
                     ? info.screen.map { currentDesktopIndex(onScreenAt: $0.frame.origin) } ?? 0
-                    : ids.compactMap { spaceIndex[$0] }.min() ?? 0
+                    : layout.desktop(forSpaces: ids)
             }
             result.append(info)
         }
@@ -304,64 +312,35 @@ final class SpaceWindowService {
     func isWindowOnOtherSpace(_ windowNumber: Int) -> Bool {
         let target = spaceIDs(forWindowNumbers: [windowNumber])
         guard !target.isEmpty else { return false }
-        let current = currentSpaceIDs()
+        let current = snapshotLayout().currentSpaceIDs   // fresh: called on click
         return !target.contains(where: { current.contains($0) })
     }
 
-    /// Desktop numbering as macOS shows it (Mission Control labels, Ctrl+N shortcuts):
-    /// only real desktops count (`type` 0 — fullscreen-app Spaces are skipped), numbered
-    /// 1…N continuously across displays in CGSCopyManagedDisplaySpaces order (a second
-    /// display's first desktop follows the main display's last). Space id → number.
-    private func desktopNumbers(_ displays: [[String: Any]]) -> [UInt64: Int] {
-        var map: [UInt64: Int] = [:]
-        for display in displays {
-            for s in (display["Spaces"] as? [[String: Any]]) ?? [] {
-                guard (s["type"] as? Int ?? 0) == 0, let id = spaceID(from: s) else { continue }
-                map[id] = map.count + 1
-            }
+    /// One CGSCopyManagedDisplaySpaces call mapped onto the current screens.
+    private func snapshotLayout() -> SpaceLayout {
+        let raw = CGSCopyManagedDisplaySpaces(cid).flatMap { ($0 as NSArray) as? [[String: Any]] } ?? []
+        let screens = NSScreen.screens.map {
+            SpaceLayout.Screen(key: $0.key, uuid: $0.displayUUID, isPrimary: $0.frame.origin == .zero)
         }
-        return map
-    }
-
-    private func managedDisplays() -> [[String: Any]] {
-        guard let raw = CGSCopyManagedDisplaySpaces(cid),
-              let displays = (raw as NSArray) as? [[String: Any]] else { return [] }
-        return displays
-    }
-
-    /// Map each Space id → its 1-based desktop number (see `desktopNumbers`).
-    private func spaceIDToDesktopIndex() -> [UInt64: Int] {
-        desktopNumbers(managedDisplays())
+        return SpaceLayout(raw: raw, screens: screens)
     }
 
     /// Desktop number of the current Space on the screen at `origin` (each display
     /// has its own current Space), or 0 (fullscreen-app Space / unknown screen).
     func currentDesktopIndex(onScreenAt origin: CGPoint) -> Int {
-        let displays = managedDisplays()
-        guard let screen = NSScreen.screens.first(where: { $0.frame.origin == origin }),
-              let current = display(for: screen, in: displays)?["Current Space"] as? [String: Any],
-              let id = spaceID(from: current) else { return 0 }
-        return desktopNumbers(displays)[id] ?? 0
+        layout.currentDesktop(onScreen: "\(origin.x),\(origin.y)")
     }
 
     /// Screens (by `NSScreen.key`) currently showing fullscreen content — their bars
     /// hide; bars on other screens stay. Two signals:
-    /// 1) The display's current Space is a fullscreen-app Space (`type` ≠ 0, or a
-    ///    tiled fullscreen pair) — native green-button fullscreen, fullscreen video.
+    /// 1) The display's current Space is a fullscreen-app Space (`SpaceLayout`) —
+    ///    native green-button fullscreen, split view, fullscreen video.
     /// 2) A slideshow-style app window that is exactly the screen's frame without a
     ///    fullscreen Space (PowerPoint/Keynote presenting). Only checked on screens
     ///    that reserve a menu bar or Dock: where `visibleFrame == frame`, a zoomed
     ///    window is screen-sized too and must not count.
-    func fullscreenScreens() -> Set<String> {
-        var result = Set<String>()
-        let displays = managedDisplays()
-        for display in displays {
-            guard let current = display["Current Space"] as? [String: Any] else { continue }
-            let type = current["type"] as? Int ?? 0
-            if type != 0 || current["TileLayoutManager"] != nil {
-                screens(for: display, displayCount: displays.count).forEach { result.insert($0.key) }
-            }
-        }
+    private func fullscreenScreens() -> Set<String> {
+        var result = layout.fullscreenScreenKeys
         let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         guard let infoList = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]]
         else { return result }
@@ -376,57 +355,6 @@ final class SpaceWindowService {
                 && abs(f.width - w) < 4 && abs(f.height - h) < 4 {
                 result.insert(key)
             }
-        }
-        return result
-    }
-
-    /// The NSScreens a CGS display entry covers. With "Displays have separate Spaces"
-    /// off there's a single shared entry for every screen; otherwise the entry's
-    /// identifier is the display UUID, or the literal "Main" for the primary display.
-    private func screens(for display: [String: Any], displayCount: Int) -> [NSScreen] {
-        if displayCount == 1 { return NSScreen.screens }
-        let id = display["Display Identifier"] as? String
-        return NSScreen.screens.filter {
-            (id == "Main" && $0.frame.origin == .zero) || (id != nil && $0.displayUUID == id)
-        }
-    }
-
-    /// The CGS display entry for a screen (see `screens(for:displayCount:)`).
-    private func display(for screen: NSScreen, in displays: [[String: Any]]) -> [String: Any]? {
-        displays.first { screens(for: $0, displayCount: displays.count).contains(screen) }
-    }
-
-    /// The active space id on each display.
-    private func currentSpaceIDs() -> Set<UInt64> {
-        guard let raw = CGSCopyManagedDisplaySpaces(cid),
-              let displays = (raw as NSArray) as? [[String: Any]] else { return [] }
-        var result = Set<UInt64>()
-        for display in displays {
-            if let current = display["Current Space"] as? [String: Any],
-               let id = spaceID(from: current) {
-                result.insert(id)
-            }
-        }
-        return result
-    }
-
-    private func spaceID(from dict: [String: Any]) -> UInt64? {
-        if let n = dict["ManagedSpaceID"] as? NSNumber { return n.uint64Value }
-        if let n = dict["id64"] as? NSNumber { return n.uint64Value }
-        return nil
-    }
-
-    /// Current-Space label ("Desk N") for EACH display, keyed by its display UUID
-    /// string — each monitor has its own current Space (numbered per `desktopNumbers`).
-    func currentDesktopNames() -> [String: String] {
-        let displays = managedDisplays()
-        let numbers = desktopNumbers(displays)
-        var result: [String: String] = [:]
-        for display in displays {
-            guard let uuid = display["Display Identifier"] as? String,
-                  let current = display["Current Space"] as? [String: Any],
-                  let currentID = spaceID(from: current) else { continue }
-            result[uuid] = numbers[currentID].map { "Desk \($0)" } ?? "Desk"
         }
         return result
     }

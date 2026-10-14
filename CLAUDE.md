@@ -13,6 +13,11 @@ TBP_DEBUG=1 ./TaskbarPlus.app/Contents/MacOS/TaskbarPlus   # verbose logging to 
 TBP_BORDERS=1 …      # draw colored debug borders around the layout zones
 ```
 
+- **Tests:** `./test.sh` — unit tests for the pure logic (`SpaceLayout`, fixture data
+  shaped like CGS output: multi-monitor, fullscreen/split-view Spaces, "Main" id, shared
+  Spaces, garbage). Run after touching Space/desktop logic.
+- **Diagnostics:** menu-bar → *Copy Diagnostics* copies screens / Spaces / windows (no
+  titles) — ask users with odd setups for it.
 - **No SwiftPM.** This machine's Command Line Tools ship a `libPackageDescription.dylib`
   that's out of sync with the swiftc frontend, so `swift build` fails on any manifest.
   `build.sh` invokes `swiftc` directly on the source list — **add new `.swift` files to
@@ -35,7 +40,13 @@ TBP_BORDERS=1 …      # draw colored debug borders around the layout zones
 - **Screen Recording** — needed for window *titles* (`kCGWindowName`). Without it the
   switcher falls back to app names. The bar itself works without it.
 - **Accessibility** — needed to raise/close a *specific* window (AX API).
-- Neither blocks core function; both are requested at launch via `WindowControl`.
+- Neither blocks core function. `Permissions` tracks both (polled every 2s): a launch
+  alert (suppressible), a ⚠︎ menu-bar icon, and per-permission **Fix…** menu items.
+- **Stale grants (the trap):** TCC is keyed to the code signature, so after installing a
+  differently-signed build System Settings still shows TaskbarPlus ON but
+  `AXIsProcessTrusted()` is false. `Permissions.fix` runs `tccutil reset <service>
+  <bundle id>` first, then re-prompts and opens the pane. Screen Recording
+  (`CGPreflightScreenCaptureAccess`) only flips after a relaunch → "Restart" item.
 
 ## Architecture
 
@@ -96,8 +107,14 @@ expanding to fill the middle, folders + Trash right).
 - **Grouped:** boxes in desktop order plus a last "other" box (`otherDesktop` = 0) for
   windows on fullscreen-app Spaces; widths weighted by window count; when they don't fit,
   the active desktop and its nearest neighbours are kept.
-- **Per display:** fullscreen hides only that screen's bar (`fullscreenScreens()`), and
-  each bar's active desktop comes from its own display (`currentDesktopIndex(onScreenAt:)`).
+- **Spaces model:** all Space/desktop answers come from `SpaceLayout` — one
+  `CGSCopyManagedDisplaySpaces` snapshot per refresh mapped onto screens (by
+  `NSScreen.key`). Desktop numbers skip fullscreen/split-view Spaces and run across
+  displays; fullscreen hides only that screen's bar; each bar's active desktop and label
+  come from its own display.
+- **Fullscreen apps always get a button** (any space mode) — each sits on its own Space,
+  so it would otherwise vanish from the bar once you leave it. Click → app activation
+  switches to its Space.
 - **Desktop switching** posts the user's configured "Switch to Desktop N" binding
   (symbolichotkeys 118+N−1), not a hard-coded Ctrl+N; if it's disabled the click just
   raises/activates.

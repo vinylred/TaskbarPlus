@@ -1,24 +1,9 @@
 import AppKit
 import ApplicationServices
 
-/// Permission requests and per-window raising via the Accessibility API.
+/// Per-window raise / close / resize via the Accessibility API. (Permission status
+/// and the "Fix…" flow live in Permissions.)
 enum WindowControl {
-
-    /// Ask for Screen Recording (needed for window titles) and Accessibility
-    /// (needed to raise a specific window). Both show a one-time system prompt.
-    static func requestPermissions() {
-        // Screen Recording: prompts the first time only; no-op once granted.
-        if !CGPreflightScreenCaptureAccess() {
-            CGRequestScreenCaptureAccess()
-        }
-
-        // Accessibility: only prompt when not already trusted. Calling with
-        // prompt:true unconditionally would re-show the dialog every launch.
-        if !AXIsProcessTrusted() {
-            let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-            _ = AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
-        }
-    }
 
     /// Bring a specific window to the front: activate its app, un-minimize and
     /// raise the matching AX window. Falls back to just activating the app if

@@ -1,19 +1,20 @@
 import AppKit
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var config = LayoutConfig.load()
     private let service = SpaceWindowService()
     private let dockModel = DockModelService()
     private let fitter = WindowFitter()
     private var prefs: PreferencesController?
     private var statusItem: NSStatusItem?
+    private let permissions = Permissions()
 
     /// One panel per target screen, keyed by `NSScreen.key` (its frame origin;
     /// CGPoint isn't Hashable before macOS 15).
     private var panels: [String: TaskbarPanel] = [:]
     private var latestItems: [DockItem] = []
     private var latestWindows: [WindowInfo] = []
-    private var latestDesktops: [String: String] = [:]   // display UUID -> "Desk N"
+    private var latestDesktops: [String: String] = [:]   // NSScreen.key -> "Desk N"
     /// Screens (by `NSScreen.key`) showing fullscreen content — their bars hide.
     private var fullscreenScreens = Set<String>()
 
@@ -29,16 +30,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// The desktop name for a screen. CGSCopyManagedDisplaySpaces keys the primary
-    /// display as the literal "Main" (not a UUID), so fall back to that for the
-    /// primary screen (frame origin .zero) when the UUID doesn't match. With
-    /// "Displays have separate Spaces" off there's a single shared entry ("Main") —
-    /// every screen shows that one.
+    /// The desktop name for a screen (the service maps screens to Spaces — see
+    /// SpaceLayout).
     private func desktopName(for screen: NSScreen) -> String? {
-        if let uuid = screen.displayUUID, let n = latestDesktops[uuid] { return n }
-        if screen.frame.origin == .zero, let n = latestDesktops["Main"] { return n }
-        if latestDesktops.count == 1 { return latestDesktops.values.first }
-        return nil
+        latestDesktops[screen.key]
     }
 
     /// Push each panel its own screen's desktop name.
@@ -120,7 +115,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self, selector: #selector(displaysChanged),
             name: NSApplication.didChangeScreenParametersNotification, object: nil)
 
-        WindowControl.requestPermissions()
+        // Missing / stale Accessibility or Screen Recording grants: explain + offer Fix
+        // (launch alert, ⚠︎ menu-bar icon, menu items). See Permissions.
+        permissions.onChange = { [weak self] in self?.updateStatusIcon() }
+        permissions.start()
         DesktopSwitcher.ensureShortcutsEnabled()   // Ctrl+N desktop shortcuts for cross-space clicks
         service.spaceMode = config.spaceMode   // restore persisted mode
         dockModel.taskbarOnly = config.taskbarOnly // taskbar-only mode hides Dock-provided sections
@@ -139,19 +137,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = NSImage(systemSymbolName: "menubar.dock.rectangle",
-                                     accessibilityDescription: "Taskbar Plus")
         let menu = NSMenu()
+        menu.delegate = self   // rebuilt on open (menuNeedsUpdate) to reflect permissions
+        item.menu = menu
+        statusItem = item
+        updateStatusIcon()
+    }
+
+    /// ⚠︎ icon while a permission is missing, so the problem is visible at a glance.
+    private func updateStatusIcon() {
+        let warn = !permissions.missing.isEmpty
+        statusItem?.button?.image = NSImage(
+            systemSymbolName: warn ? "exclamationmark.triangle" : "menubar.dock.rectangle",
+            accessibilityDescription: warn ? "Taskbar Plus — permission needed" : "Taskbar Plus")
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
         menu.addItem(NSMenuItem(title: "Taskbar Plus", action: nil, keyEquivalent: ""))
         menu.addItem(.separator())
+        // Each missing permission: what's broken (disabled line) + a one-click Fix.
+        for kind in permissions.missing {
+            let warning = NSMenuItem(title: "⚠︎ \(kind.title) not granted", action: nil, keyEquivalent: "")
+            warning.toolTip = "Without it, \(kind.consequence)."
+            menu.addItem(warning)
+            let fix = NSMenuItem(title: "    Fix \(kind.title)…", action: #selector(fixPermission(_:)), keyEquivalent: "")
+            fix.target = self
+            fix.representedObject = kind
+            menu.addItem(fix)
+        }
+        if !permissions.missing.isEmpty {
+            let restart = NSMenuItem(title: "Restart Taskbar Plus", action: #selector(restartApp), keyEquivalent: "")
+            restart.target = self
+            restart.toolTip = "Screen Recording only takes effect after a restart."
+            menu.addItem(restart)
+            menu.addItem(.separator())
+        }
         let prefItem = NSMenuItem(title: "Preferences…", action: #selector(openPreferences), keyEquivalent: ",")
         prefItem.target = self
         menu.addItem(prefItem)
+        let diag = NSMenuItem(title: "Copy Diagnostics", action: #selector(copyDiagnostics), keyEquivalent: "")
+        diag.target = self
+        diag.toolTip = "Copies the screen / Spaces / window layout (no window titles) for a bug report."
+        menu.addItem(diag)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Taskbar Plus", action: #selector(NSApplication.terminate(_:)),
                                 keyEquivalent: "q"))
-        item.menu = menu
-        statusItem = item
+    }
+
+    @objc private func fixPermission(_ sender: NSMenuItem) {
+        guard let kind = sender.representedObject as? Permissions.Kind else { return }
+        permissions.fix(kind)
+    }
+
+    @objc private func restartApp() { permissions.relaunch() }
+
+    /// Bug-report snapshot to the clipboard: versions, settings, permissions, screens,
+    /// the Spaces layout as the app sees it, and the switcher's windows (app names
+    /// only — no window titles, which can be private).
+    @objc private func copyDiagnostics() {
+        let info = Bundle.main.infoDictionary
+        var out = ["Taskbar Plus \(info?["CFBundleShortVersionString"] ?? "?") (\(info?["CFBundleVersion"] ?? "?"))",
+                   "macOS \(ProcessInfo.processInfo.operatingSystemVersionString)",
+                   "settings: taskbarOnly=\(config.taskbarOnly) spaceMode=\(config.spaceMode.rawValue) "
+                   + "groupByApp=\(config.groupByApp) compact=\(config.compact) monitors=\(config.monitors.rawValue)",
+                   "missing permissions: \(permissions.missing.map { $0.title })",
+                   "", "screens:"]
+        for s in NSScreen.screens {
+            out.append("  \(s.key) frame=\(s.frame) visible=\(s.visibleFrame) uuid=\(s.displayUUID ?? "?")"
+                       + " label=\(latestDesktops[s.key] ?? "-") bar=\(panels[s.key] != nil) hidden=\(fullscreenScreens.contains(s.key))")
+        }
+        out += ["", "spaces (F = fullscreen app):"]
+        for d in service.layout.displays {
+            out.append("  \(d.identifier ?? "?") → screens \(d.screenKeys) current=\(d.currentSpace ?? 0)"
+                       + " spaces=\(d.spaces.map { "\($0.id)\($0.isDesktop ? "" : "F")" })")
+        }
+        out.append("  desktop numbers: \(service.layout.desktopNumbers.sorted { $0.value < $1.value }.map { "\($0.key)→\($0.value)" })")
+        out += ["", "windows (\(latestWindows.count)):"]
+        for w in latestWindows {
+            out.append("  #\(w.windowNumber) \(w.ownerName) desk=\(w.desktopIndex) frame=\(w.frame)")
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(out.joined(separator: "\n"), forType: .string)
     }
 
     @objc private func openPreferences() {
