@@ -64,12 +64,21 @@ enum WindowControl {
         return AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, value) == .success
     }
 
+    /// Whether the window is one of its app's open windows (incl. minimized) per AX —
+    /// false for closed windows an app merely keeps alive off-screen, and when
+    /// Accessibility isn't granted. Exact CGWindowID match only.
+    static func isOpen(windowNumber: Int, pid: pid_t) -> Bool {
+        axWindow(windowNumber: windowNumber, pid: pid, title: "") != nil
+    }
+
     /// The AX window matching `windowNumber` (by CGWindowID), falling back to a title
     /// match — the AX window list doesn't always expose the CGWindowID for every
     /// window, which made some clicks no-op.
     private static func axWindow(windowNumber: Int, pid: pid_t, title: String) -> AXUIElement? {
         guard AXIsProcessTrusted() else { return nil }
         let appElement = AXUIElementCreateApplication(pid)
+        // Don't let a hung app stall the bar (default AX timeout is ~6s).
+        AXUIElementSetMessagingTimeout(appElement, 0.5)
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
               let windows = value as? [AXUIElement] else { return nil }

@@ -57,6 +57,10 @@ final class SpaceWindowService {
     private var cachedWindows: [Int: WindowInfo] = [:]
     /// Consecutive refreshes a known window has been absent (hysteresis counter).
     private var windowMisses: [Int: Int] = [:]
+    /// Off-screen windows on no Space are either minimized (real — keep) or closed
+    /// windows an app keeps alive off-screen (e.g. Notes' main window — skip). AX
+    /// tells them apart; the verdict is cached per window while it stays off-screen.
+    private var liveOffscreen: [Int: Bool] = [:]
 
     private var debounceTimer: Timer?
     private var safetyPoll: Timer?
@@ -198,7 +202,7 @@ final class SpaceWindowService {
         guard let infoList = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]],
               !infoList.isEmpty else { return nil }
 
-        struct Raw { let num: Int; let pid: pid_t; let owner: String; let title: String; let frame: CGRect }
+        struct Raw { let num: Int; let pid: pid_t; let owner: String; let title: String; let frame: CGRect; let onScreen: Bool }
         var raws: [Raw] = []
         for info in infoList {
             guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
@@ -227,7 +231,7 @@ final class SpaceWindowService {
             // would become ghost buttons when titles are unavailable.
             let onScreen = (info[kCGWindowIsOnscreen as String] as? Bool) ?? false
             if !onScreen && title.isEmpty { continue }
-            raws.append(Raw(num: num, pid: pid_t(pid), owner: owner, title: title, frame: frame))
+            raws.append(Raw(num: num, pid: pid_t(pid), owner: owner, title: title, frame: frame, onScreen: onScreen))
         }
 
         // When titles are available (Screen Recording granted), drop untitled
@@ -259,21 +263,37 @@ final class SpaceWindowService {
 
         var icons: [pid_t: NSImage] = [:]
         var result: [WindowInfo] = []
+        // Forget cached verdicts for windows that came back on screen or are gone.
+        let offscreenNow = Set(raws.filter { !$0.onScreen }.map { $0.num })
+        liveOffscreen = liveOffscreen.filter { offscreenNow.contains($0.key) }
         for r in raws {
             let ids = spaceIDs(forWindowNumbers: [r.num])
-            // currentSpace mode: keep windows on a visible Space, plus minimized windows
-            // (they belong to no Space; CGS returns none for them).
-            if !allSpaces, !ids.isEmpty, !ids.contains(where: { currentSpaces.contains($0) }) { continue }
+            // On no Space: minimized (keep) or closed-but-retained (skip) — ask AX once.
+            let noSpace = ids.isEmpty
+            if noSpace && !r.onScreen {
+                let live = liveOffscreen[r.num] ?? WindowControl.isOpen(windowNumber: r.num, pid: r.pid)
+                liveOffscreen[r.num] = live
+                if !live { continue }
+            }
+            // currentSpace mode: keep windows on a visible Space, plus minimized ones.
+            if !allSpaces, !noSpace, !ids.contains(where: { currentSpaces.contains($0) }) { continue }
             let icon = icons[r.pid] ?? {
                 let img = NSRunningApplication(processIdentifier: r.pid)?.icon
                     ?? NSImage(named: NSImage.applicationIconName) ?? NSImage()
                 icons[r.pid] = img
                 return img
             }()
-            let desktopIdx = allSpaces ? (ids.compactMap { spaceIndex[$0] }.min() ?? 0) : 0
-            result.append(WindowInfo(windowNumber: r.num, pid: r.pid,
-                                     ownerName: r.owner, title: r.title, icon: icon,
-                                     frame: r.frame, desktopIndex: desktopIdx))
+            var info = WindowInfo(windowNumber: r.num, pid: r.pid,
+                                  ownerName: r.owner, title: r.title, icon: icon,
+                                  frame: r.frame, desktopIndex: 0)
+            if allSpaces {
+                // Minimized windows (no Space) belong with the desktop they'll restore
+                // onto — the current one of their screen — not the "other" box.
+                info.desktopIndex = noSpace
+                    ? info.screen.map { currentDesktopIndex(onScreenAt: $0.frame.origin) } ?? 0
+                    : ids.compactMap { spaceIndex[$0] }.min() ?? 0
+            }
+            result.append(info)
         }
         return result
     }
