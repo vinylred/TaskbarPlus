@@ -62,9 +62,20 @@ Then remove it from System Settings → Privacy & Security → Accessibility / S
 
 ## Configuration
 
-Settings are in the menu-bar icon → **Preferences** (layout zones, alignment, theme,
-monitors, grouped-desktop ordering, split mode). They're persisted to
-`~/.taskbarplus.json`.
+Settings are in the menu-bar icon → **Preferences**:
+
+- **Dock** — *Replace Dock* (the bar shows app icons, folders and Trash) or *Use
+  alongside Dock* (just Start + window buttons; the real Dock shows the apps).
+- **Height** — standard (two rows of window buttons) or compact (one row, shorter bar).
+- **Windows shown** — this desktop, all desktops, or grouped by desktop. Clicking the
+  Desktop label on the bar cycles this too.
+- **Group windows by app** — keep an app's windows next to each other on the bar.
+- **Monitors** — main monitor only, or every monitor.
+- **Theme** — auto, light or dark.
+- **Start at login.**
+
+They're persisted to `~/.taskbarplus.json`. Maximised windows are automatically
+shortened to stop at the bar's top edge (needs Accessibility permission).
 
 ## Building from source
 

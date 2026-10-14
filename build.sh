@@ -39,7 +39,9 @@ swiftc \
     Sources/TaskbarPlus/PreferencesController.swift \
     Sources/TaskbarPlus/WindowInfo.swift \
     Sources/TaskbarPlus/WindowControl.swift \
+    Sources/TaskbarPlus/WindowFitter.swift \
     Sources/TaskbarPlus/SpaceWindowService.swift \
+    Sources/TaskbarPlus/SystemShortcut.swift \
     Sources/TaskbarPlus/TaskbarPanel.swift \
     Sources/TaskbarPlus/main.swift \
     -o "${BUILD_DIR}/${APP_NAME}"

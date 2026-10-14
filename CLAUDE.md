@@ -22,6 +22,12 @@ TBP_BORDERS=1 …      # draw colored debug borders around the layout zones
   Recording) grants are keyed to the code signature, so ad-hoc's per-build hash change
   makes macOS forget permissions every rebuild. `build.sh` `pkill`s the running instance
   before signing (codesign races on the in-use binary otherwise).
+  To create the identity on a new machine: `openssl req -x509` a cert with
+  `extendedKeyUsage = critical,codeSigning` and CN `TaskbarPlus Dev`, export it as .p12,
+  and `security import id.p12 -k ~/Library/Keychains/login.keychain-db -T /usr/bin/codesign`.
+  It does NOT need to be marked trusted (`find-identity` shows `CSSMERR_TP_NOT_TRUSTED`,
+  but codesign still uses it). After switching from ad-hoc, `tccutil reset Accessibility
+  com.dreamfolks.taskbarplus` and re-grant — a stale ad-hoc grant shows "on" but fails.
 - Sandbox **off**, hardened runtime **off** (uses private frameworks + arbitrary app control).
 
 ## Permissions
@@ -44,7 +50,7 @@ SpaceWindowService ──onChange(apps)──▶ DockModelService ──onChange
 - **`SpaceWindowService`** — the engine. Enumerates windows via `CGWindowListCopyWindowInfo`,
   maps them to Spaces via private CGS calls (`CGSCopyManagedDisplaySpaces`,
   `CGSCopySpacesForWindows` — declared in the `CSkyLight` C shim). Emits the current‑Space
-  app list, the per‑window list, and per‑display "Desktop N" labels. Polls every 0.5s +
+  app list, the per‑window list, and per‑display "Desk N" labels. Polls every 0.5s +
   reacts to `NSWorkspace` notifications (debounced); Space changes refresh immediately.
 - **`DockModelService`** — reads the real Dock's `com.apple.dock` prefs (`persistent-apps`,
   `persistent-others`) into pinned launchers + folders + Trash, merges in running state
@@ -59,15 +65,52 @@ SpaceWindowService ──onChange(apps)──▶ DockModelService ──onChange
 
 ## Configuration — `~/.taskbarplus.json`
 
-Sections: `launcher`, `pinned`, `running`, `others` (folders+Trash), `switcher`.
-Each takes a zone string or an object `{zone, expand, align}`:
-- `zone`: `left` | `center` | `right`
-- `expand`: `left` | `right` — stretch to fill toward that edge
-- `align`: `left` | `center` | `right` — position content within the area
+Only six keys (deliberately kept minimal — don't re-add per-section layout options):
+- `taskbarOnly` (bool, "Use alongside Dock") — hide pinned/running/folders/Trash (the real
+  Dock shows them). The switcher pins right when the Dock is at the bottom, else it's
+  centered on the screen. Old configs used the key `splitMode`; it's still read.
+- `spaceMode`: `currentSpace` | `allSpaces` | `grouped`. The "Desk N" label on the bar
+  is a toggle cycling these ("Desk N" / "All Desks" / "Grouped").
+- `groupByApp` (bool) — order the switcher so an app's windows are adjacent (plain
+  buttons, no sub-menu); applied in `AppDelegate.distributeWindows`.
+- `compact` (bool) — 36pt one-row bar (26pt icons, `maxRows` 1, desktop label beside
+  the Apps button) instead of the 60pt two-row bar. Panel geometry comes from the
+  instance properties `barHeight` / `iconSize` / `maxRows`.
+- `monitors`: `dock` (primary only) | `all`.
+- `theme`: `auto` | `light` | `dark`.
 
-Top‑level keys: `theme` (`auto`/`light`/`dark`), `monitors` (`dock`/`all`),
-`spaceMode` (`currentSpace`/`allSpaces`/`grouped`). The "Desktop N" label is a **toggle**
-cycling those three space modes.
+The bar layout is fixed in `LayoutConfig.zones` (Start + icons left, switcher
+expanding to fill the middle, folders + Trash right).
+
+## Window switcher behaviour
+
+- **Order is creation order** (sorted by CGWindowID, which only increases) and apps by
+  launch date — never first-seen or CGWindowList z-order, which reshuffled the bar on
+  every Space switch / focus change. `groupByApp` reorders on top of that.
+- **Which windows:** enumerated WITHOUT `.optionOnScreenOnly` so minimized windows and
+  hidden apps keep a button; scoped by per-window Space id. Off-screen windows only count
+  when titled (apps keep untitled 500×500 off-screen helpers → ghost buttons otherwise).
+  Same-titled windows merge only when one lies inside the other (Teams overlay).
+- **Overflow:** windows that don't fit at `WindowButton.minWidth` go into a trailing
+  "» N" `OverflowButton` (menu) — in the flat switcher and in each grouped box.
+- **Grouped:** boxes in desktop order plus a last "other" box (`otherDesktop` = 0) for
+  windows on fullscreen-app Spaces; widths weighted by window count; when they don't fit,
+  the active desktop and its nearest neighbours are kept.
+- **Per display:** fullscreen hides only that screen's bar (`fullscreenScreens()`), and
+  each bar's active desktop comes from its own display (`currentDesktopIndex(onScreenAt:)`).
+- **Desktop switching** posts the user's configured "Switch to Desktop N" binding
+  (symbolichotkeys 118+N−1), not a hard-coded Ctrl+N; if it's disabled the click just
+  raises/activates.
+
+## Maximised windows
+
+macOS only reserves space for its own Dock/menu bar, so `WindowFitter` (driven by
+`SpaceWindowService.onWindowsPolled` every poll) shortens windows that start at the top of
+the usable area and reach into a bar, via AX `setSize`. It memoises the frame it tried so
+an app that refuses/rounds the size isn't fought every 0.5s. Fitted windows stop
+`WindowFitter.gap` (6pt) ABOVE the bar, not flush: macOS's resize zone extends outside the
+window edge, and flush against the bar the owning app keeps showing the resize cursor
+over the bar (fighting the bar's own `NSCursor.arrow`). Don't remove the gap.
 
 ## Hard‑won constraints (do NOT relearn these)
 

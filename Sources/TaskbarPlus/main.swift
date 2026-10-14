@@ -4,53 +4,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var config = LayoutConfig.load()
     private let service = SpaceWindowService()
     private let dockModel = DockModelService()
+    private let fitter = WindowFitter()
     private var prefs: PreferencesController?
     private var statusItem: NSStatusItem?
 
-    /// One panel per target screen, keyed by a string of the screen's frame origin
-    /// (CGPoint isn't Hashable before macOS 15).
+    /// One panel per target screen, keyed by `NSScreen.key` (its frame origin;
+    /// CGPoint isn't Hashable before macOS 15).
     private var panels: [String: TaskbarPanel] = [:]
     private var latestItems: [DockItem] = []
     private var latestWindows: [WindowInfo] = []
-    private var latestDesktops: [String: String] = [:]   // display UUID -> "Desktop N"
-    private var fullscreen = false                        // a fullscreen app is frontmost
+    private var latestDesktops: [String: String] = [:]   // display UUID -> "Desk N"
+    /// Screens (by `NSScreen.key`) showing fullscreen content — their bars hide.
+    private var fullscreenScreens = Set<String>()
 
-    /// Hide all bars while a fullscreen app is frontmost; show them otherwise.
+    /// Hide the bar on screens showing fullscreen content; show the others.
     /// Use alphaValue (not orderOut/orderFront) — ordering fights the panels'
     /// `.canJoinAllSpaces` behavior and left a bar stuck hidden after Space switches.
     private func applyVisibility() {
-        for panel in panels.values {
-            panel.alphaValue = fullscreen ? 0 : 1
-            panel.ignoresMouseEvents = fullscreen   // don't eat clicks while hidden
+        for (key, panel) in panels {
+            let hidden = fullscreenScreens.contains(key)
+            panel.alphaValue = hidden ? 0 : 1
+            panel.ignoresMouseEvents = hidden   // don't eat clicks while hidden
+            panel.settleHoverLevel()
         }
-    }
-
-    /// Panels are keyed by screen origin AND side, so a screen's two split panels
-    /// (left/right) don't collide on one key.
-    private func key(_ origin: CGPoint, _ side: SplitSide) -> String {
-        "\(origin.x),\(origin.y)|\(side)"
-    }
-
-    /// Each screen gets one full-width bar. (Split mode uses the same single bar but
-    /// below the Dock's z-order, with only launcher + switcher shown at the edges.)
-    private func sides() -> [SplitSide] { [.full] }
-
-    /// The CGS display-UUID string for an NSScreen, to match service desktop names.
-    private func displayUUID(of screen: NSScreen) -> String? {
-        guard let num = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
-        else { return nil }
-        let displayID = CGDirectDisplayID(num.uint32Value)
-        guard let cfUUID = CGDisplayCreateUUIDFromDisplayID(displayID)?.takeRetainedValue()
-        else { return nil }
-        return CFUUIDCreateString(nil, cfUUID) as String
     }
 
     /// The desktop name for a screen. CGSCopyManagedDisplaySpaces keys the primary
     /// display as the literal "Main" (not a UUID), so fall back to that for the
-    /// primary screen (frame origin .zero) when the UUID doesn't match.
+    /// primary screen (frame origin .zero) when the UUID doesn't match. With
+    /// "Displays have separate Spaces" off there's a single shared entry ("Main") —
+    /// every screen shows that one.
     private func desktopName(for screen: NSScreen) -> String? {
-        if let uuid = displayUUID(of: screen), let n = latestDesktops[uuid] { return n }
+        if let uuid = screen.displayUUID, let n = latestDesktops[uuid] { return n }
         if screen.frame.origin == .zero, let n = latestDesktops["Main"] { return n }
+        if latestDesktops.count == 1 { return latestDesktops.values.first }
         return nil
     }
 
@@ -60,7 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // mode each shows its own current desktop.
         switch config.spaceMode {
         case .allSpaces:
-            panels.values.forEach { $0.updateDesktop("All Desktops") }
+            panels.values.forEach { $0.updateDesktop("All Desks") }
             return
         case .grouped:
             panels.values.forEach { $0.updateDesktop("Grouped") }
@@ -69,8 +56,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             break
         }
         for screen in NSScreen.screens {
-            guard let name = desktopName(for: screen) else { continue }
-            for side in sides() { panels[key(screen.frame.origin, side)]?.updateDesktop(name) }
+            // Always set something: a stale "Grouped" or an empty (unclickable) label
+            // would otherwise remain on a screen we can't name.
+            let name = desktopName(for: screen) ?? "Desk"
+            panels[screen.key]?.updateDesktop(name)
         }
     }
 
@@ -78,9 +67,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func toggleSpaceMode() {
         config.spaceMode = config.spaceMode.next
         config.save()
-        service.spaceMode = config.spaceMode   // triggers refreshNow()
-        panels.values.forEach { $0.setGrouped(config.spaceMode == .grouped) }
+        // Label first (it changes the launcher's width, which the chips are sized
+        // against), then the grouped flag, then the service refresh — so the panels
+        // rebuild once, with the new mode and final geometry.
         applyDesktopNames()
+        panels.values.forEach { $0.setGrouped(config.spaceMode == .grouped) }
+        service.spaceMode = config.spaceMode   // triggers refreshNow()
         prefs?.syncConfig(config)   // so a later prefs edit doesn't revert the mode
     }
 
@@ -108,11 +100,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.latestDesktops = names
             self?.applyDesktopNames()
         }
-        // Hide the bar entirely when a fullscreen app is frontmost (presentation,
-        // fullscreen video, etc.); show it again on exit.
-        service.onFullscreenChange = { [weak self] fullscreen in
-            self?.fullscreen = fullscreen
+        // Hide a screen's bar while it shows fullscreen content (presentation,
+        // fullscreen video, etc.); show it again on exit. Other screens keep theirs.
+        service.onFullscreenChange = { [weak self] screens in
+            self?.fullscreenScreens = screens
             self?.applyVisibility()
+        }
+        // Keep maximised windows from extending under the bar. Only visible bars count
+        // (a screen showing fullscreen content has its bar hidden — nothing to avoid).
+        service.onWindowsPolled = { [weak self] windows in
+            guard let self else { return }
+            let bars = self.panels.filter { !self.fullscreenScreens.contains($0.key) }.map { $0.value.frame }
+            self.fitter.fit(windows, bars: bars,
+                            isOnOtherSpace: { [weak self] in self?.service.isWindowOnOtherSpace($0) ?? true })
         }
 
         // Recreate panels when displays change (plug/unplug, resolution).
@@ -123,7 +123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         WindowControl.requestPermissions()
         DesktopSwitcher.ensureShortcutsEnabled()   // Ctrl+N desktop shortcuts for cross-space clicks
         service.spaceMode = config.spaceMode   // restore persisted mode
-        dockModel.splitMode = config.splitMode // split mode hides Dock-provided sections
+        dockModel.taskbarOnly = config.taskbarOnly // taskbar-only mode hides Dock-provided sections
         dockModel.start()
         service.start()
         applyDesktopNames()
@@ -170,7 +170,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Update service modes BEFORE rebuilding so the first model emission carries
         // the right sections for the new config.
         service.spaceMode = config.spaceMode
-        dockModel.splitMode = config.splitMode
+        dockModel.taskbarOnly = config.taskbarOnly
         // Panels read config at init, so recreate them all. close() (with
         // isReleasedWhenClosed=false) removes them from AppKit's window list so ARC
         // can deallocate once we drop our reference.
@@ -196,57 +196,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func rebuildPanels() {
         let wanted = targetScreens()
-        var wantedKeys = Set<String>()
-        for screen in wanted { for side in sides() { wantedKeys.insert(key(screen.frame.origin, side)) } }
+        let wantedKeys = Set(wanted.map { $0.key })
 
-        // Drop panels no longer wanted (screen gone, or mode changed full↔split).
+        // Drop panels no longer wanted (screen gone, or monitors setting changed).
         for (k, panel) in panels where !wantedKeys.contains(k) {
             panel.close()
             panels[k] = nil
         }
-        // Create panels for newly-wanted (screen, side) pairs.
-        for screen in wanted {
-            for side in sides() where panels[key(screen.frame.origin, side)] == nil {
-                panels[key(screen.frame.origin, side)] = makePanel(screen: screen, side: side)
-            }
+        // Create panels for newly-wanted screens.
+        for screen in wanted where panels[screen.key] == nil {
+            panels[screen.key] = makePanel(screen: screen)
         }
     }
 
-    private func makePanel(screen: NSScreen, side: SplitSide) -> TaskbarPanel {
-        let panel = TaskbarPanel(screen: screen, config: config, side: side)
+    private func makePanel(screen: NSScreen) -> TaskbarPanel {
+        let panel = TaskbarPanel(screen: screen, config: config)
         panel.onCloseRequested = { [weak self] in self?.service.refreshNow() }
         panel.onToggleSpaceMode = { [weak self] in self?.toggleSpaceMode() }
         panel.onIsWindowOnOtherSpace = { [weak self] num in
             self?.service.isWindowOnOtherSpace(num) ?? false
         }
-        panel.desktopCount = { [weak self] in self?.service.desktopCount() ?? 0 }
-        panel.activeDesktop = { [weak self] in self?.service.currentDesktopIndex() ?? 0 }
+        // Each bar's own screen's current desktop (displays have separate Spaces).
+        let origin = screen.frame.origin
+        panel.activeDesktop = { [weak self] in self?.service.currentDesktopIndex(onScreenAt: origin) ?? 0 }
         panel.setGrouped(config.spaceMode == .grouped)
         if config.spaceMode == .allSpaces {
-            panel.updateDesktop("All Desktops")
+            panel.updateDesktop("All Desks")
         } else if config.spaceMode == .grouped {
             panel.updateDesktop("Grouped")
-        } else if let name = desktopName(for: screen) {
-            panel.updateDesktop(name)
+        } else {
+            panel.updateDesktop(desktopName(for: screen) ?? "Desk")
         }
-        if fullscreen { panel.alphaValue = 0; panel.ignoresMouseEvents = true }  // stay hidden if created during fullscreen
+        if fullscreenScreens.contains(screen.key) {   // stay hidden if created during fullscreen
+            panel.alphaValue = 0
+            panel.ignoresMouseEvents = true
+        }
         return panel
     }
 
     /// Send each panel the windows whose screen matches that panel (or all windows
-    /// to the single bar when only the Dock monitor is shown). Both split sides of a
-    /// screen get the same window set (only the right panel renders the switcher).
+    /// to the single bar when only the main monitor is shown).
     private func distributeWindows() {
+        let all = config.groupByApp ? Self.groupedByApp(latestWindows) : latestWindows
         for screen in targetScreens() {
             let windows: [WindowInfo]
             switch config.monitors {
-            case .dock: windows = latestWindows
-            case .all:  windows = latestWindows.filter { $0.screen?.frame.origin == screen.frame.origin }
+            case .dock: windows = all
+            case .all:  windows = all.filter { $0.screen?.frame.origin == screen.frame.origin }
             }
-            for side in sides() {
-                panels[key(screen.frame.origin, side)]?.updateWindows(windows)
-            }
+            panels[screen.key]?.updateWindows(windows)
         }
+    }
+
+    /// Reorder so each app's windows sit next to each other (plain buttons, no
+    /// sub-menu). Apps keep the order they first appear in; windows keep their
+    /// relative order within an app. Stable, so buttons don't shuffle on refresh.
+    private static func groupedByApp(_ windows: [WindowInfo]) -> [WindowInfo] {
+        var appRank: [pid_t: Int] = [:]
+        for w in windows where appRank[w.pid] == nil { appRank[w.pid] = appRank.count }
+        return windows.enumerated()
+            .sorted { (appRank[$0.element.pid]!, $0.offset) < (appRank[$1.element.pid]!, $1.offset) }
+            .map { $0.element }
     }
 }
 

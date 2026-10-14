@@ -1,37 +1,32 @@
 import AppKit
 
-/// A small Preferences window for editing the taskbar layout. Changes apply live
-/// via the `onChange` callback (which persists the config and rebuilds the bars).
+/// A small Preferences window. Changes apply live via the `onChange` callback (which
+/// persists the config and rebuilds the bars).
 final class PreferencesController: NSObject {
 
     private let window: NSWindow
     private let onChange: (LayoutConfig) -> Void
     private var config: LayoutConfig
 
-    // Per-section controls.
-    private var zonePickers: [Section: NSSegmentedControl] = [:]
-    private var expandPickers: [Section: NSSegmentedControl] = [:]
-    private var alignPickers: [Section: NSSegmentedControl] = [:]
+    private var dockPicker: NSSegmentedControl!
+    private var heightPicker: NSSegmentedControl!
+    private var spaceModePicker: NSSegmentedControl!
     private var monitorsPicker: NSSegmentedControl!
     private var themePicker: NSSegmentedControl!
-    private var groupedOrderPicker: NSSegmentedControl!
-    private var splitModeCheckbox: NSButton!
+    private var groupByAppCheckbox: NSButton!
+    private var loginCheckbox: NSButton!
 
-    private static let zones: [Zone] = [.left, .center, .right]
-    private static let expands: [Expand?] = [nil, .left, .right]
-    private static let aligns: [Align] = [.left, .center, .right]
+    private static let spaceModes: [SpaceMode] = [.currentSpace, .allSpaces, .grouped]
     private static let themes: [Theme] = [.auto, .light, .dark]
-    private static let groupedOrders: [GroupedOrder] = [.default, .currentToRight]
 
     init(config: LayoutConfig, onChange: @escaping (LayoutConfig) -> Void) {
         self.config = config
         self.onChange = onChange
 
-        let width: CGFloat = 620
+        let width: CGFloat = 480
         let rowH: CGFloat = 40
-        let sections = Section.allCases
-        // sections + Monitors + Theme + Grouped-order + Mode + Startup rows.
-        let height = CGFloat(sections.count + 5) * rowH + 90
+        // Dock + Height + Windows shown + Group by app + Monitors + Theme + Startup rows.
+        let height = 7 * rowH + 30
 
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
@@ -41,133 +36,73 @@ final class PreferencesController: NSObject {
         window.isReleasedWhenClosed = false
 
         super.init()
-        buildUI(width: width, rowH: rowH, height: height, sections: sections)
+        buildUI(width: width, rowH: rowH, height: height)
     }
 
     func show() {
+        // The login item can be changed in System Settings while we're cached.
+        loginCheckbox.state = LoginItem.isEnabled ? .on : .off
         window.center()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
     }
 
     /// Keep the controller's config in sync with changes made OUTSIDE the prefs pane
-    /// (e.g. the bar's Desktop label toggling spaceMode). Without this, the next change
-    /// in the pane would write back this stale spaceMode and revert the bar's mode.
+    /// (e.g. the bar's Desktop label cycling spaceMode). Without this, the next change
+    /// in the pane would write back the stale spaceMode and revert the bar's mode.
     func syncConfig(_ newConfig: LayoutConfig) {
         config = newConfig
+        spaceModePicker.selectedSegment = Self.spaceModes.firstIndex(of: config.spaceMode) ?? 0
     }
 
     // MARK: - UI construction
 
-    private func buildUI(width: CGFloat, rowH: CGFloat, height: CGFloat, sections: [Section]) {
+    private func buildUI(width: CGFloat, rowH: CGFloat, height: CGFloat) {
         let content = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        var y = height - 20
 
-        func label(_ text: String, _ frame: NSRect, bold: Bool = false) -> NSTextField {
-            let l = NSTextField(labelWithString: text)
-            l.frame = frame
-            l.font = bold ? .boldSystemFont(ofSize: 12) : .systemFont(ofSize: 12)
-            return l
-        }
-
-        // Column headers.
-        var y = height - 36
-        content.addSubview(label("Section", NSRect(x: 20, y: y, width: 90, height: 18), bold: true))
-        content.addSubview(label("Position", NSRect(x: 120, y: y, width: 150, height: 18), bold: true))
-        content.addSubview(label("Expand", NSRect(x: 290, y: y, width: 120, height: 18), bold: true))
-        content.addSubview(label("Align", NSRect(x: 450, y: y, width: 150, height: 18), bold: true))
-
-        let sectionTitles: [Section: String] = [
-            .launcher: "App launcher", .pinned: "Pinned apps", .running: "Running apps",
-            .others: "Folders + Trash", .switcher: "Window switcher",
-        ]
-
-        for section in sections {
+        /// One labelled row with a segmented control.
+        func row(_ title: String, _ labels: [String], selected: Int) -> NSSegmentedControl {
             y -= rowH
-            content.addSubview(label(sectionTitles[section] ?? section.rawValue,
-                                     NSRect(x: 20, y: y, width: 95, height: 22)))
-
-            // Zone picker.
-            let zone = NSSegmentedControl(labels: ["Left", "Center", "Right"],
-                                          trackingMode: .selectOne,
-                                          target: self, action: #selector(changed))
-            zone.frame = NSRect(x: 120, y: y - 2, width: 160, height: 24)
-            zone.selectedSegment = Self.zones.firstIndex(of: config.zone(for: section)) ?? 1
-            zone.tag = tag(section, kind: 0)
-            content.addSubview(zone)
-            zonePickers[section] = zone
-
-            // Expand picker.
-            let expand = NSSegmentedControl(labels: ["None", "←", "→"],
-                                            trackingMode: .selectOne,
+            let l = NSTextField(labelWithString: title)
+            l.frame = NSRect(x: 20, y: y, width: 110, height: 22)
+            l.font = .boldSystemFont(ofSize: 12)
+            content.addSubview(l)
+            let picker = NSSegmentedControl(labels: labels, trackingMode: .selectOne,
                                             target: self, action: #selector(changed))
-            expand.frame = NSRect(x: 290, y: y - 2, width: 130, height: 24)
-            expand.selectedSegment = Self.expands.firstIndex(of: config.expand(for: section)) ?? 0
-            expand.tag = tag(section, kind: 1)
-            content.addSubview(expand)
-            expandPickers[section] = expand
-
-            // Align picker.
-            let align = NSSegmentedControl(labels: ["Left", "Center", "Right"],
-                                           trackingMode: .selectOne,
-                                           target: self, action: #selector(changed))
-            align.frame = NSRect(x: 450, y: y - 2, width: 160, height: 24)
-            align.selectedSegment = Self.aligns.firstIndex(of: config.align(for: section)) ?? 0
-            align.tag = tag(section, kind: 2)
-            content.addSubview(align)
-            alignPickers[section] = align
+            picker.frame = NSRect(x: 135, y: y - 2, width: width - 155, height: 24)
+            picker.selectedSegment = selected
+            content.addSubview(picker)
+            return picker
         }
 
-        // Monitors row.
+        dockPicker = row("Dock", ["Replace Dock", "Use alongside Dock"],
+                         selected: config.taskbarOnly ? 1 : 0)
+        heightPicker = row("Height", ["Standard (2 rows)", "Compact (1 row)"],
+                           selected: config.compact ? 1 : 0)
+        spaceModePicker = row("Windows shown", ["This desktop", "All desktops", "Grouped"],
+                              selected: Self.spaceModes.firstIndex(of: config.spaceMode) ?? 0)
         y -= rowH
-        content.addSubview(label("Monitors", NSRect(x: 20, y: y, width: 95, height: 22), bold: true))
-        let mon = NSSegmentedControl(labels: ["Dock monitor", "All monitors"],
-                                     trackingMode: .selectOne,
-                                     target: self, action: #selector(changed))
-        mon.frame = NSRect(x: 120, y: y - 2, width: 220, height: 24)
-        mon.selectedSegment = (config.monitors == .all) ? 1 : 0
-        content.addSubview(mon)
-        monitorsPicker = mon
-
-        // Theme row.
-        y -= rowH
-        content.addSubview(label("Theme", NSRect(x: 20, y: y, width: 95, height: 22), bold: true))
-        let theme = NSSegmentedControl(labels: ["Auto", "Light", "Dark"],
-                                       trackingMode: .selectOne,
-                                       target: self, action: #selector(changed))
-        theme.frame = NSRect(x: 120, y: y - 2, width: 220, height: 24)
-        theme.selectedSegment = Self.themes.firstIndex(of: config.theme) ?? 0
-        content.addSubview(theme)
-        themePicker = theme
-
-        // Grouped-order row (only affects grouped space mode).
-        y -= rowH
-        content.addSubview(label("Grouped order", NSRect(x: 20, y: y, width: 95, height: 22), bold: true))
-        let gorder = NSSegmentedControl(labels: ["Default", "Current → right"],
-                                        trackingMode: .selectOne,
-                                        target: self, action: #selector(changed))
-        gorder.frame = NSRect(x: 120, y: y - 2, width: 240, height: 24)
-        gorder.selectedSegment = Self.groupedOrders.firstIndex(of: config.groupedOrder) ?? 0
-        content.addSubview(gorder)
-        groupedOrderPicker = gorder
-
-        // Split-mode row (coexist with the real Dock).
-        y -= rowH
-        content.addSubview(label("Mode", NSRect(x: 20, y: y, width: 95, height: 22), bold: true))
-        let split = NSButton(checkboxWithTitle: "Split mode (coexist with Dock)",
+        let group = NSButton(checkboxWithTitle: "Group windows by app",
                              target: self, action: #selector(changed))
-        split.frame = NSRect(x: 118, y: y - 2, width: 300, height: 24)
-        split.state = config.splitMode ? .on : .off
-        content.addSubview(split)
-        splitModeCheckbox = split
+        group.frame = NSRect(x: 133, y: y - 2, width: 300, height: 24)
+        group.state = config.groupByApp ? .on : .off
+        content.addSubview(group)
+        groupByAppCheckbox = group
+
+        monitorsPicker = row("Monitors", ["Main only", "All monitors"],
+                             selected: config.monitors == .all ? 1 : 0)
+        themePicker = row("Theme", ["Auto", "Light", "Dark"],
+                          selected: Self.themes.firstIndex(of: config.theme) ?? 0)
 
         // Start-at-login row (system login item, not part of the JSON config).
         y -= rowH
-        content.addSubview(label("Startup", NSRect(x: 20, y: y, width: 95, height: 22), bold: true))
         let login = NSButton(checkboxWithTitle: "Start at login",
                              target: self, action: #selector(toggleLogin(_:)))
-        login.frame = NSRect(x: 118, y: y - 2, width: 220, height: 24)
+        login.frame = NSRect(x: 133, y: y - 2, width: 220, height: 24)
         login.state = LoginItem.isEnabled ? .on : .off
         content.addSubview(login)
+        loginCheckbox = login
 
         window.contentView = content
     }
@@ -177,28 +112,16 @@ final class PreferencesController: NSObject {
         if !ok { sender.state = LoginItem.isEnabled ? .on : .off }  // revert on failure
     }
 
-    // Encode (section, kind) into a control tag.
-    private func tag(_ section: Section, kind: Int) -> Int {
-        (Section.allCases.firstIndex(of: section) ?? 0) * 10 + kind
-    }
-
     // MARK: - Live apply
 
     @objc private func changed() {
-        var placements: [Section: Placement] = [:]
-        for section in Section.allCases {
-            let zone = Self.zones[zonePickers[section]?.selectedSegment ?? 1]
-            let expand = Self.expands[expandPickers[section]?.selectedSegment ?? 0]
-            let align = Self.aligns[alignPickers[section]?.selectedSegment ?? 0]
-            placements[section] = Placement(zone: zone, expand: expand, align: align)
-        }
-        let monitors: Monitors = (monitorsPicker.selectedSegment == 1) ? .all : .dock
-        let theme = Self.themes[themePicker.selectedSegment]
-        let groupedOrder = Self.groupedOrders[groupedOrderPicker.selectedSegment]
-        // spaceMode is toggled via the bar's Desktop label, not here — preserve it.
-        config = LayoutConfig(placements: placements, monitors: monitors, theme: theme,
-                              spaceMode: config.spaceMode, groupedOrder: groupedOrder,
-                              splitMode: splitModeCheckbox.state == .on)
+        config = LayoutConfig(
+            monitors: monitorsPicker.selectedSegment == 1 ? .all : .dock,
+            theme: Self.themes[themePicker.selectedSegment],
+            spaceMode: Self.spaceModes[spaceModePicker.selectedSegment],
+            taskbarOnly: dockPicker.selectedSegment == 1,
+            groupByApp: groupByAppCheckbox.state == .on,
+            compact: heightPicker.selectedSegment == 1)
         onChange(config)
     }
 }

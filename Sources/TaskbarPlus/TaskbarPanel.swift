@@ -1,29 +1,23 @@
 import AppKit
 import CSkyLight
 
-/// A borderless, non-activating panel that floats a Dock-style row of icons along
-/// the bottom edge of the main screen and stays visible on every Space.
-///
-/// Layout mirrors the real Dock: [pinned] | [running-only] | [folders + Trash],
-/// with separators only between non-empty sections and a running-dot under each
-/// running app. Each icon hosts a right-click context menu.
-/// Which portion of the screen width a panel occupies. `.full` is the normal
-/// single bar; `.left`/`.right` are the two narrow split-mode panels with a clear
-/// center gap between them for the real Dock.
-enum SplitSide { case full, left, right }
-
+/// A borderless, non-activating panel along the bottom edge of one screen, visible
+/// on every Space: [Apps launcher + pinned + running icons] … [window switcher] …
+/// [folders + Trash], with separators only between non-empty sections and a
+/// running-dot under each running app. In taskbar-only mode only the launcher and
+/// the switcher show. Each icon / window button hosts a right-click context menu.
 final class TaskbarPanel: NSPanel {
 
-    static let iconSize: CGFloat = 40
-    private static let barHeight: CGFloat = 60
+    /// Standard: 60pt bar, 40pt icons, two rows of window buttons. Compact: one row.
+    var iconSize: CGFloat { config.compact ? 26 : 40 }
+    private var barHeight: CGFloat { config.compact ? 36 : 60 }
+    /// Rows of window buttons the switcher (and each grouped box) may use.
+    private var maxRows: Int { config.compact ? 1 : 2 }
     private static let horizontalPadding: CGFloat = 14
-    /// Fallback center gap (split mode) when the Dock width can't be estimated.
-    private static let centerGapFraction: CGFloat = 0.40
 
     private let config: LayoutConfig
-    private let side: SplitSide
 
-    /// Split-mode resting level (Dock floats on top) and the raised level (above Dock).
+    /// taskbar-only resting level (Dock floats on top) and the raised level (above Dock).
     private static let belowDock = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) - 1)
     private static let aboveDock = NSWindow.Level.statusBar
 
@@ -34,7 +28,7 @@ final class TaskbarPanel: NSPanel {
 
     // Per-section content containers (filled by update*, then placed into a zone).
     private let launcherStack = NSStackView()
-    private let launcherButton = LauncherButton()
+    private let launcherButton: LauncherButton
     private let pinnedStack = NSStackView()
     private let runningStack = NSStackView()
     private let othersStack = NSStackView()
@@ -62,10 +56,10 @@ final class TaskbarPanel: NSPanel {
     /// it survives display reconfiguration.
     private let targetFrameOrigin: CGPoint
 
-    init(screen: NSScreen, config: LayoutConfig, side: SplitSide = .full) {
+    init(screen: NSScreen, config: LayoutConfig) {
         self.targetFrameOrigin = screen.frame.origin
         self.config = config
-        self.side = side
+        self.launcherButton = LauncherButton(compact: config.compact)
         super.init(
             contentRect: .zero,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -74,10 +68,10 @@ final class TaskbarPanel: NSPanel {
         )
 
         isFloatingPanel = true
-        // Normal bar floats above everything (statusBar = 25 > dock = 20). Split mode
+        // Normal bar floats above everything (statusBar = 25 > dock = 20). Taskbar-only mode
         // rests JUST BELOW the Dock (dock − 1) so the Dock floats on top in the center;
         // hovering the bar raises it above the Dock (see mouseEntered/Exited).
-        level = config.splitMode ? Self.belowDock : .statusBar
+        level = config.taskbarOnly ? Self.belowDock : .statusBar
         collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
         backgroundColor = .clear
         isOpaque = false
@@ -91,6 +85,16 @@ final class TaskbarPanel: NSPanel {
         // Theme: nil = follow the OS (auto); else force light/dark. This drives the
         // visual-effect view, label colors, and the Win95 buttons' effectiveAppearance.
         appearance = config.theme.appearance
+        // Auto theme: grouped-box borders / the active underline bake a light- or
+        // dark-specific CGColor, so rebuild the switcher when the system appearance flips.
+        if config.theme == .auto {
+            appearanceObservation = NSApp.observe(\.effectiveAppearance) { [weak self] _, _ in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.rebuildSwitcher(self.lastWindows, force: true)
+                }
+            }
+        }
 
         // Frosted blur background (the original look). `.sidebar` adapts to light/dark.
         let blur = NSVisualEffectView()
@@ -108,7 +112,7 @@ final class TaskbarPanel: NSPanel {
         // instead of ballooning the canvas. Pinning to the superview/themeFrame did NOT
         // work — that lets the themeFrame grow with the content; a constant does not.
         let bw = blur.widthAnchor.constraint(equalToConstant: 100)
-        let bh = blur.heightAnchor.constraint(equalToConstant: Self.barHeight)
+        let bh = blur.heightAnchor.constraint(equalToConstant: barHeight)
         bw.priority = .required
         bh.priority = .required
         NSLayoutConstraint.activate([bw, bh])
@@ -135,7 +139,7 @@ final class TaskbarPanel: NSPanel {
         // Grouped-mode segment row (sibling of the two rows; only one is shown).
         segmentRow.orientation = .horizontal
         segmentRow.alignment = .top   // boxes share a top edge; the active underline hangs below
-        segmentRow.distribution = .fillEqually   // every group box gets equal width and fills the row
+        segmentRow.distribution = .fill   // each box carries its own (window-count-weighted) width
         segmentRow.spacing = 8
         segmentRow.isHidden = true
         switcherStack.addArrangedSubview(segmentRow)
@@ -169,10 +173,11 @@ final class TaskbarPanel: NSPanel {
             switcherStack.layer?.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.25).cgColor
         }
 
-        if config.splitMode {
-            // Split mode: launcher pinned LEFT, switcher (right zone) pinned RIGHT and
-            // grows leftward. No center zone / no-overlap guards — those were pushing
-            // the right zone off-screen. The launcher is tiny, so there's no overlap.
+        if config.taskbarOnly {
+            // Taskbar-only mode: launcher pinned LEFT. With a bottom Dock the switcher
+            // (right zone) is pinned RIGHT and grows leftward (it may run under the Dock,
+            // which floats on top); otherwise it's centered (center zone, below). No zone-to-zone
+            // no-overlap guards — those were pushing the right zone off-screen.
             leftZone.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: Self.horizontalPadding).isActive = true
             let rightPin = rightZone.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -Self.horizontalPadding)
             rightPin.priority = .required
@@ -180,7 +185,16 @@ final class TaskbarPanel: NSPanel {
             // is forced to shrink/cap rather than overflow either edge).
             let floor = rightZone.leadingAnchor.constraint(greaterThanOrEqualTo: leftZone.trailingAnchor, constant: 16)
             floor.priority = .required
-            NSLayoutConstraint.activate([rightPin, floor])
+            // When the Dock isn't at the bottom, the switcher moves to the center zone,
+            // centered on the SCREEN's midpoint (the bar itself may stop short of a side
+            // Dock, so its own center is off by the Dock's width). Bounded required
+            // between the launcher and the right edge; the centering is the bias.
+            let centerX = centerZone.centerXAnchor.constraint(equalTo: blur.centerXAnchor)
+            centerX.priority = .defaultHigh
+            let centerFloor = centerZone.leadingAnchor.constraint(greaterThanOrEqualTo: leftZone.trailingAnchor, constant: 16)
+            let centerCeil = centerZone.trailingAnchor.constraint(lessThanOrEqualTo: blur.trailingAnchor, constant: -Self.horizontalPadding)
+            NSLayoutConstraint.activate([rightPin, floor, centerX, centerFloor, centerCeil])
+            centerXConstraint = centerX
             reposition()
             NotificationCenter.default.addObserver(
                 self, selector: #selector(reposition),
@@ -189,33 +203,22 @@ final class TaskbarPanel: NSPanel {
             return
         }
 
-        switch side {
-        case .full:
-            // Full bar: three zones (left edge / centered / right edge) with
-            // no-overlap guards. Edge pins required; guards lower so they can't shove
-            // a zone off-screen.
-            let leftPin = leftZone.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: Self.horizontalPadding)
-            let rightPin = rightZone.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -Self.horizontalPadding)
-            leftPin.priority = .required
-            rightPin.priority = .required
-            let guardL = centerZone.leadingAnchor.constraint(greaterThanOrEqualTo: leftZone.trailingAnchor, constant: 16)
-            let guardR = rightZone.leadingAnchor.constraint(greaterThanOrEqualTo: centerZone.trailingAnchor, constant: 16)
-            guardL.priority = .defaultHigh
-            guardR.priority = .defaultHigh
-            NSLayoutConstraint.activate([
-                leftPin, rightPin,
-                centerZone.centerXAnchor.constraint(equalTo: blur.centerXAnchor),
-                guardL, guardR,
-            ])
-        case .left:
-            // Split-left panel hosts only the launcher (left zone), pinned to the
-            // left edge. Center/right zones are unused (no constraints → zero size).
-            leftZone.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: Self.horizontalPadding).isActive = true
-        case .right:
-            // Split-right panel hosts only the switcher (right zone), pinned to the
-            // right edge so it can't run off-panel.
-            rightZone.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -Self.horizontalPadding).isActive = true
-        }
+        // Full bar: three zones (left edge / centered / right edge) with no-overlap
+        // guards. Edge pins required; guards lower so they can't shove a zone
+        // off-screen.
+        let leftPin = leftZone.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: Self.horizontalPadding)
+        let rightPin = rightZone.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -Self.horizontalPadding)
+        leftPin.priority = .required
+        rightPin.priority = .required
+        let guardL = centerZone.leadingAnchor.constraint(greaterThanOrEqualTo: leftZone.trailingAnchor, constant: 16)
+        let guardR = rightZone.leadingAnchor.constraint(greaterThanOrEqualTo: centerZone.trailingAnchor, constant: 16)
+        guardL.priority = .defaultHigh
+        guardR.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            leftPin, rightPin,
+            centerZone.centerXAnchor.constraint(equalTo: blur.centerXAnchor),
+            guardL, guardR,
+        ])
 
         reposition()
         NotificationCenter.default.addObserver(
@@ -240,40 +243,83 @@ final class TaskbarPanel: NSPanel {
             ?? NSScreen.screens.first(where: { $0.frame.origin == .zero })
             ?? NSScreen.screens.first
         guard let screen else { return }
-        let h = Self.barHeight
-        // Normal mode: sit in the visible area (above the Dock). Split mode: sit at the
+        let h = barHeight
+        // Normal mode: sit in the visible area (above the Dock). Taskbar-only mode: sit at the
         // screen's true bottom edge, level with the Dock — the Dock floats on top in the
         // center (bar is below the Dock's window level), launcher/switcher show at edges.
-        let area = config.splitMode ? screen.frame : screen.visibleFrame
+        // Horizontally, taskbar-only mode still takes visibleFrame's span: with the Dock on the
+        // left/right, visibleFrame excludes the Dock's strip, so the bar ends beside the
+        // Dock instead of running under it (and covering it when raised on hover).
+        // With a bottom Dock, visibleFrame spans the full width, so nothing changes.
+        let vf = screen.visibleFrame
+        let area = config.taskbarOnly
+            ? NSRect(x: vf.minX, y: screen.frame.minY, width: vf.width, height: h)
+            : vf
         setFrame(NSRect(x: area.minX, y: area.minY, width: area.width, height: h), display: true)
         // Clamp the blur (contentView) to exactly the panel width so its content can't
         // balloon the content rect past the window and clip the right zone.
         blurWidthConstraint?.constant = area.width
+        // Screen midpoint relative to the bar's midpoint (non-zero with a side Dock).
+        centerXConstraint?.constant = screen.frame.midX - area.midX
+        // Taskbar-only layout depends on where the Dock is: re-mount the switcher if
+        // the Dock moved to/from the bottom (bottom Dock → visibleFrame starts above
+        // the screen's bottom edge).
+        // Also re-fit the chips when the geometry they were sized for changed (bar
+        // width, screen-center offset) — e.g. resolution change, side Dock resized.
+        let atBottom = vf.minY > screen.frame.minY
+        let geometry = "\(area.width)|\(centerXConstraint?.constant ?? 0)|\(atBottom)"
+        if geometry != lastGeometry {
+            let first = lastGeometry.isEmpty
+            lastGeometry = geometry
+            dockAtBottom = atBottom
+            if !first { rebuildSwitcher(lastWindows, force: true) }   // recomputes width + reassembles zones
+        }
         contentView?.layoutSubtreeIfNeeded()
         installHoverTracking()
     }
 
     private var hoverTracking: NSTrackingArea?
 
-    /// In split mode, track the mouse over the bar so we can raise it above the Dock
-    /// on hover. The Dock-covered center won't deliver enter events (the Dock gets
-    /// them) — only the visible launcher/switcher edges trigger it, which is intended.
+    /// Track the mouse over the whole bar:
+    /// - Cursor: the bar is a non-key panel, so AppKit's cursor rects never reset the
+    ///   cursor here. Crossing a maximised window's bottom edge (which sits right on
+    ///   the bar) leaves its resize cursor showing over the bar; we force the arrow.
+    /// - Taskbar-only mode: raise the bar above the Dock on hover. The Dock-covered
+    ///   center won't deliver enter events (the Dock gets them) — only the visible
+    ///   launcher/switcher edges trigger it, which is intended.
     private func installHoverTracking() {
-        guard config.splitMode, let view = contentView else { return }
+        guard let view = contentView else { return }
         if let t = hoverTracking { view.removeTrackingArea(t) }
         let t = NSTrackingArea(rect: view.bounds,
-                               options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                               options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
                                owner: self, userInfo: nil)
         view.addTrackingArea(t)
         hoverTracking = t
     }
 
     override func mouseEntered(with event: NSEvent) {
-        if config.splitMode { level = Self.aboveDock }   // rise above the Dock
+        NSCursor.arrow.set()
+        if config.taskbarOnly { level = Self.aboveDock }   // rise above the Dock
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        NSCursor.arrow.set()
     }
 
     override func mouseExited(with event: NSEvent) {
-        if config.splitMode { level = Self.belowDock }   // settle back under the Dock
+        if config.taskbarOnly { level = Self.belowDock }   // settle back under the Dock
+    }
+
+    /// Drop back under the Dock if the hover raise is stale — e.g. the bar was hidden
+    /// (fullscreen) while hovered: a window ignoring mouse events gets no mouseExited.
+    func settleHoverLevel() {
+        guard config.taskbarOnly else { return }
+        if !frame.contains(NSEvent.mouseLocation) { level = Self.belowDock }
+    }
+
+    override func close() {
+        TooltipWindow.shared.hide()
+        super.close()
     }
 
     // MARK: - Update
@@ -282,8 +328,7 @@ final class TaskbarPanel: NSPanel {
     private var dockSignature = ""
     private var grouped = false
     /// Number of desktops to segment into (grouped mode). Provided by the controller.
-    var desktopCount: () -> Int = { 0 }
-    /// 1-based index of the active desktop (grouped mode places it rightmost).
+    /// 1-based index of the active desktop (grouped mode underlines its box).
     var activeDesktop: () -> Int = { 0 }
 
     /// Update the desktop-name label under the Apps button.
@@ -305,7 +350,8 @@ final class TaskbarPanel: NSPanel {
     func update(items: [DockItem]) {
         // Skip the (relatively expensive) view rebuild when nothing changed — this
         // is called many times per second under activity. Signature covers identity,
-        // label, section, and running-dot state.
+        // label, section, running-dot state, and the icon instance (icons are cached, so
+        // a new instance means a real change: Trash empty↔full, or a refreshed app icon).
         let signature = items.map {
             let id: String
             switch $0.kind {
@@ -313,10 +359,12 @@ final class TaskbarPanel: NSPanel {
             case .folder(let url): id = url.path
             case .trash: id = "trash"
             }
-            return "\($0.section):\(id):\($0.label):\($0.isRunning)"
+            return "\($0.section):\(id):\($0.label):\($0.isRunning):\(ObjectIdentifier($0.icon).hashValue)"
         }.joined(separator: "|")
         guard signature != dockSignature else { return }
         dockSignature = signature
+        // The hovered icon may be about to be removed; removed views get no mouseExited.
+        TooltipWindow.shared.hide()
 
         for stack in [pinnedStack, runningStack, othersStack] {
             for v in stack.arrangedSubviews { stack.removeView(v) }
@@ -340,6 +388,23 @@ final class TaskbarPanel: NSPanel {
     }
 
     private var lastDockCount = -1
+
+    /// Whether the real Dock sits along the bottom of this panel's screen (set in
+    /// reposition()). Taskbar-only mode pins the switcher right only then; with a
+    /// side Dock (or none on this screen) the switcher is centered instead.
+    private var dockAtBottom = true
+    /// Taskbar-only mode: offsets the center zone to the screen's midpoint.
+    private var centerXConstraint: NSLayoutConstraint?
+    private var appearanceObservation: NSKeyValueObservation?
+    /// Geometry the switcher chips were last sized for (see reposition()).
+    private var lastGeometry = ""
+
+    /// Zone a section renders in on this panel. Like `config.effectiveZone`, except
+    /// that taskbar-only mode centers the switcher when the Dock isn't at the bottom.
+    private func effectiveZone(for section: Section) -> Zone {
+        if config.taskbarOnly && section == .switcher && !dockAtBottom { return .center }
+        return config.effectiveZone(for: section)
+    }
 
     /// The content container view for each logical section.
     private func container(for section: Section) -> NSView {
@@ -374,12 +439,9 @@ final class TaskbarPanel: NSPanel {
         // Stable section order within any zone.
         let order: [Section] = [.launcher, .pinned, .running, .others, .switcher]
         for zoneKind in [Zone.left, .center, .right] {
-            // This panel only mounts sections whose effective zone matches its side
-            // (left panel → left zone, right panel → right zone, full → all zones).
-            guard sideAllows(zoneKind) else { continue }
             let stack = zoneStack(zoneKind)
             let members = order.filter {
-                config.sectionIsVisible($0) && config.effectiveZone(for: $0) == zoneKind && !isEmpty($0)
+                config.sectionIsVisible($0) && effectiveZone(for: $0) == zoneKind && !isEmpty($0)
             }
             for (i, section) in members.enumerated() {
                 if i > 0 { stack.addArrangedSubview(makeSeparator()) }
@@ -389,51 +451,28 @@ final class TaskbarPanel: NSPanel {
         applySwitcherExpand()
     }
 
-    /// Whether this panel's side renders content for the given zone.
-    private func sideAllows(_ zone: Zone) -> Bool {
-        switch side {
-        case .full:  return true
-        case .left:  return zone == .left
-        case .right: return zone == .right
-        }
-    }
-
     private var switcherExpandConstraints: [NSLayoutConstraint] = []
     /// Required constant width on the blur, kept equal to the panel's on-screen width
     /// so autolayout can't balloon the content rect past the window (see contentView setup).
     private var blurWidthConstraint: NSLayoutConstraint?
 
-    /// If the switcher is configured to expand, pull it OUT of its zone stack and
-    /// pin its edges directly to the blur so it spans exactly the gap toward the
-    /// expand edge — its buttons then stretch (.fillEqually) to fill it. No feedback
-    /// loop, no overshoot. If not expanding, it stays a normal zone member.
+    /// Replace-Dock mode: pull the switcher OUT of its zone stack and pin it directly
+    /// to the blur so it spans exactly the gap between the left icons and the right
+    /// zone. No feedback loop, no overshoot. In taskbar-only mode it stays a normal
+    /// zone member.
     private func applySwitcherExpand() {
         NSLayoutConstraint.deactivate(switcherExpandConstraints)
         switcherExpandConstraints = []
 
-        let expand = config.expand(for: .switcher)
-        // Follow the configured align in every mode (don't hard-code right for split).
-        let align = config.align(for: .switcher)
-
         switcherRow1.distribution = .fill
         switcherRow2.distribution = .fill
-        // Vertical stack's horizontal alignment positions the button rows within the
-        // switcher's area, per `align`.
-        switch align {
-        case .left:   switcherStack.alignment = .leading
-        case .center: switcherStack.alignment = .centerX
-        case .right:  switcherStack.alignment = .trailing
-        }
+        // Button rows start at the switcher area's left edge.
+        switcherStack.alignment = .leading
 
-        // Only pull the switcher OUT of its zone for genuine `expand` (where it must
-        // span a wider area than its content). For plain align — including the common
-        // center case — leave it as a normal member of its zone: the zone constraints
-        // (leftZone→left edge, centerZone→centerX, rightZone→right edge, with
-        // no-overlap guards) already position it correctly and robustly. This avoids
-        // the fragile edge-pinning that kept mispositioning the right zone.
-        // In split mode the switcher owns its whole panel and is pinned right by the
-        // zone constraints, so the expand pull-out is unnecessary.
-        let needsArea = (expand != nil) && !isEmpty(.switcher) && !config.splitMode
+        // The switcher always expands to fill the gap between the left icons and the
+        // right zone (Replace-Dock mode). In taskbar-only mode it stays a member of its
+        // zone instead: the zone constraints pin it right or center it.
+        let needsArea = !isEmpty(.switcher) && !config.taskbarOnly
         guard needsArea, let blur = contentView else { return }
 
         (switcherStack.superview as? NSStackView)?.removeView(switcherStack)
@@ -445,8 +484,8 @@ final class TaskbarPanel: NSPanel {
         // edge — launcher + icons left, Trash right — and the switcher fills the gap
         // between them. Bound it required between the two zones so it can never overlap
         // them or run off-screen; its breakable (.defaultHigh) chip widths compress to
-        // fit. A .defaultHigh bias positions it toward the configured align edge when
-        // there's slack. (The flanking zones own their own edge pins; the switcher just
+        // fit. A .defaultHigh bias keeps it at the left end of that gap when there's
+        // slack. (The flanking zones own their own edge pins; the switcher just
         // takes what's left. The earlier off-screen bug was the blur ballooning past the
         // window width, fixed at contentView setup — not this logic.)
         let leadingBound = switcherStack.leadingAnchor.constraint(
@@ -456,15 +495,7 @@ final class TaskbarPanel: NSPanel {
             lessThanOrEqualTo: rightZone.leadingAnchor, constant: -gap)
         trailingBound.priority = .required
 
-        let bias: NSLayoutConstraint
-        switch align {
-        case .left:
-            bias = switcherStack.leadingAnchor.constraint(equalTo: leftZone.trailingAnchor, constant: gap)
-        case .right:
-            bias = switcherStack.trailingAnchor.constraint(equalTo: rightZone.leadingAnchor, constant: -gap)
-        case .center:
-            bias = switcherStack.centerXAnchor.constraint(equalTo: blur.centerXAnchor)
-        }
+        let bias = switcherStack.leadingAnchor.constraint(equalTo: leftZone.trailingAnchor, constant: gap)
         bias.priority = .defaultHigh
 
         let cons: [NSLayoutConstraint] = [
@@ -496,12 +527,14 @@ final class TaskbarPanel: NSPanel {
     /// is unchanged (unless `force`, e.g. the Dock width changed so capacity must
     /// be recomputed).
     private func rebuildSwitcher(_ windows: [WindowInfo], force: Bool) {
-        // Include the active desktop so grouped mode re-orders (active box rightmost)
-        // when the Space changes even if the window set is identical.
-        let activeKey = grouped ? "\(activeDesktop())|\(config.groupedOrder.rawValue)" : ""
+        // Include the active desktop so grouped mode re-renders (active-desktop
+        // indicator) when the Space changes even if the window set is identical.
+        let activeKey = grouped ? "\(activeDesktop())" : ""
         let signature = "\(grouped)|\(activeKey)|" + windows.map { "\($0.windowNumber):\($0.displayTitle):\($0.desktopIndex)" }.joined(separator: "|")
         if !force, signature == switcherSignature { return }
         switcherSignature = signature
+        // The hovered chip may be about to be removed; removed views get no mouseExited.
+        TooltipWindow.shared.hide()
 
         for v in switcherRow1.arrangedSubviews { switcherRow1.removeView(v) }
         for v in switcherRow2.arrangedSubviews { switcherRow2.removeView(v) }
@@ -517,44 +550,8 @@ final class TaskbarPanel: NSPanel {
         activeIndicator.isHidden = true   // only shown in grouped mode
         lastIndicatorDesktops = []
 
-        let avail = switcherAvailableWidth()
-        let spacing = switcherRow1.spacing
-
-        func fit(at width: CGFloat) -> Int { max(1, Int((avail + spacing) / (width + spacing))) }
-        let fitPreferred = fit(at: WindowButton.preferredWidth)   // per row at full width
-        let fitMin = fit(at: WindowButton.minWidth)               // per row at min width
-
-        let count = windows.count
-        let perRow: Int            // buttons in the (fuller) top row
-        let buttonWidth: CGFloat
-        let capacity = fitMin * 2  // absolute max across both rows
-
-        if count <= fitPreferred {
-            // Everything fits on ONE row at full width — fill row 1 only.
-            perRow = count
-            buttonWidth = WindowButton.preferredWidth
-        } else if count <= fitPreferred * 2 {
-            // Needs a second row, but still fits at full width — balance the two rows.
-            perRow = Int(ceil(Double(count) / 2.0))
-            buttonWidth = WindowButton.preferredWidth
-        } else {
-            // More than two full-width rows hold → shrink to fit (cap at fitMin*2).
-            let shownCount = min(count, capacity)
-            perRow = Int(ceil(Double(shownCount) / 2.0))
-            let raw = (avail - CGFloat(perRow - 1) * spacing) / CGFloat(perRow)
-            buttonWidth = max(WindowButton.minWidth, min(WindowButton.preferredWidth, raw))
-        }
-
-        let shown = Array(windows.prefix(count <= fitPreferred * 2 ? count : capacity))
-        let topCount = min(perRow, shown.count)
-        var newButtons: [WindowButton] = []
-        for (i, w) in shown.enumerated() {
-            let row = i < topCount ? switcherRow1 : switcherRow2
-            let btn = WindowButton(info: w, panel: self, width: buttonWidth)
-            btn.alphaValue = 0   // start hidden; fade in below
-            row.addArrangedSubview(btn)
-            newButtons.append(btn)
-        }
+        let layout = fillRows([switcherRow1, switcherRow2], with: windows, avail: switcherAvailableWidth())
+        let newButtons = layout.buttons
         switcherRow2.isHidden = switcherRow2.arrangedSubviews.isEmpty
         reassembleZones()
 
@@ -567,64 +564,119 @@ final class TaskbarPanel: NSPanel {
         }
 
         if ProcessInfo.processInfo.environment["TBP_DEBUG"] != nil {
-            NSLog("switcher: side=\(side) panelW=\(Int(frame.width)) perRow=\(perRow) w=\(Int(buttonWidth)) shown=\(shown.count)/\(windows.count)")
+            NSLog("switcher: panelW=\(Int(frame.width)) perRow=\(layout.perRow) w=\(Int(layout.width)) shown=\(newButtons.count)/\(windows.count)")
         }
     }
 
-    /// Grouped mode: one bordered segment box per desktop, each holding that
-    /// desktop's windows (in up to two internal rows).
+    /// Lay `windows` out as buttons over up to `maxRows` of `rows` within `avail`
+    /// width: full width when they fit, else shrunk (down to `WindowButton.minWidth`);
+    /// any that still don't fit go into a trailing "» N" overflow button (so the
+    /// newest windows never silently disappear). Returns the new window buttons.
+    private func fillRows(_ rows: [NSStackView], with windows: [WindowInfo],
+                          avail: CGFloat) -> (buttons: [WindowButton], perRow: Int, width: CGFloat) {
+        let spacing = rows[0].spacing
+        let nRows = min(maxRows, rows.count)
+        func fit(at width: CGFloat) -> Int { max(1, Int((avail + spacing) / (width + spacing))) }
+        let fitPreferred = fit(at: WindowButton.preferredWidth)   // per row at full width
+        let capacity = fit(at: WindowButton.minWidth) * nRows    // absolute max, all rows
+
+        let overflow = windows.count > capacity
+        let slots = overflow ? capacity : windows.count            // incl. the overflow button
+        let perRow: Int            // slots in the (fuller) top row
+        let width: CGFloat
+        if slots <= fitPreferred {
+            // Everything fits on ONE row at full width — fill row 1 only.
+            perRow = slots
+            width = WindowButton.preferredWidth
+        } else if slots <= fitPreferred * nRows {
+            // Needs a second row, but still fits at full width — balance the rows.
+            perRow = Int(ceil(Double(slots) / Double(nRows)))
+            width = WindowButton.preferredWidth
+        } else {
+            // More than the rows hold at full width → shrink to fit.
+            perRow = Int(ceil(Double(slots) / Double(nRows)))
+            let raw = (avail - CGFloat(perRow - 1) * spacing) / CGFloat(perRow)
+            width = max(WindowButton.minWidth, min(WindowButton.preferredWidth, raw))
+        }
+        func row(forSlot i: Int) -> NSStackView { rows[i < perRow ? 0 : nRows - 1] }
+
+        let shown = overflow ? Array(windows.prefix(capacity - 1)) : windows
+        var buttons: [WindowButton] = []
+        for (i, w) in shown.enumerated() {
+            let btn = WindowButton(info: w, panel: self, width: width)
+            btn.alphaValue = 0   // start hidden; faded in by the caller
+            row(forSlot: i).addArrangedSubview(btn)
+            buttons.append(btn)
+        }
+        if overflow {
+            let rest = Array(windows.dropFirst(shown.count))
+            row(forSlot: shown.count).addArrangedSubview(OverflowButton(windows: rest, panel: self))
+        }
+        for r in rows.dropFirst() { r.isHidden = r.arrangedSubviews.isEmpty }
+        return (buttons, perRow, width)
+    }
+
+    /// No boxes to show: hide the active-desktop underline (it would otherwise stay
+    /// where the last box was) and forget the old boxes.
+    private func clearGroupedIndicator() {
+        activeIndicator.isHidden = true
+        groupedBoxes = [:]
+        lastIndicatorDesktops = []
+    }
+
+    /// Key of the grouped box for windows on no numbered desktop (fullscreen-app
+    /// Spaces, or Space unknown). Shown last; never the "active" box.
+    private static let otherDesktop = 0
+
+    /// Grouped mode: one bordered box per desktop that has windows (in desktop order,
+    /// plus a last box for windows on fullscreen-app Spaces), each holding that
+    /// desktop's windows in up to `maxRows` internal rows.
     private func rebuildGrouped(_ windows: [WindowInfo]) {
         switcherRow1.isHidden = true
         switcherRow2.isHidden = true
         segmentRow.isHidden = false
 
-        let nDesktops = max(desktopCount(), windows.map { $0.desktopIndex }.max() ?? 0)
-        guard nDesktops > 0 else { return }
-
-        // Only show a box for desktops that actually have windows (skip empty ones).
-        var activeDesktops = (1...nDesktops).filter { desk in
-            windows.contains { $0.desktopIndex == desk }
-        }
-        guard !activeDesktops.isEmpty else { reassembleZones(); return }
-
-        // Box ordering. `.default` keeps the natural desktop sequence (1, 2, 3, …);
-        // `.currentToRight` moves the current desktop's box to the rightmost position
-        // (closest to the right edge, fully visible without hovering).
         let current = activeDesktop()
-        if config.groupedOrder == .currentToRight, let i = activeDesktops.firstIndex(of: current) {
-            activeDesktops.remove(at: i)
-            activeDesktops.append(current)
+        var desks = Set(windows.map { $0.desktopIndex }).sorted {
+            // Numbered desktops ascending; the "other" box last.
+            ($0 == Self.otherDesktop ? Int.max : $0) < ($1 == Self.otherDesktop ? Int.max : $1)
         }
+        guard !desks.isEmpty else { clearGroupedIndicator(); reassembleZones(); return }
 
-        // Split the available width across the (non-empty) segments. If they can't all
-        // fit even at the minimum segment width, drop the LEFTMOST (oldest) desktops —
-        // the active desktop (rightmost) and nearest neighbours stay.
+        // If the boxes can't all fit even at the minimum width, keep the ACTIVE desktop
+        // and its nearest neighbours (the "other" box counts as farthest).
         let totalAvail = switcherAvailableWidth()
         let segGap = segmentRow.spacing
         let minSeg = WindowButton.minWidth + 12
         let maxFit = max(1, Int((totalAvail + segGap) / (minSeg + segGap)))
-        if activeDesktops.count > maxFit {
-            activeDesktops = Array(activeDesktops.suffix(maxFit))   // keep rightmost (active) ones
+        if desks.count > maxFit {
+            func distance(_ d: Int) -> Int { d == Self.otherDesktop ? Int.max : abs(d - current) }
+            let keep = Set(desks.sorted { (distance($0), $0) < (distance($1), $1) }.prefix(maxFit))
+            desks = desks.filter { keep.contains($0) }
         }
-        let n = CGFloat(activeDesktops.count)
-        let rawSeg = (totalAvail - (n - 1) * segGap) / n
-        let segWidth = max(minSeg, rawSeg)
+        // Box widths: each gets the minimum, and the rest is shared in proportion to
+        // its window count — a busy desktop gets room, a 1-window desktop doesn't
+        // hog an equal share.
+        let counts = desks.map { d in windows.filter { $0.desktopIndex == d }.count }
+        let n = CGFloat(desks.count)
+        let free = max(0, totalAvail - (n - 1) * segGap - n * minSeg)
+        let totalCount = CGFloat(max(1, counts.reduce(0, +)))
+        let widths = counts.map { minSeg + free * CGFloat($0) / totalCount }
         // Boxes fill (almost) the full bar height; leave a little room below for the
         // active desktop's underline (which sits outside the box).
-        let segHeight = Self.barHeight - 14
+        let segHeight = barHeight - (config.compact ? 8 : 14)
 
         var newButtons: [WindowButton] = []
         groupedBoxes = [:]
-        for desk in activeDesktops {
+        for (desk, width) in zip(desks, widths) {
             let deskWindows = windows.filter { $0.desktopIndex == desk }
-            let (seg, box) = makeSegment(windows: deskWindows, width: segWidth, height: segHeight,
+            let (seg, box) = makeSegment(windows: deskWindows, width: width, height: segHeight,
                                          into: &newButtons)
             segmentRow.addArrangedSubview(seg)
             groupedBoxes[desk] = box
         }
-        // Pin the segment row to the full switcher area so .fillEqually divides it equally
-        // among the boxes (content then centers within each full-width box per `align`).
-        let rowWidth = (n - 1) * segGap + n * segWidth   // == totalAvail when not floored to minSeg
+        // Pin the segment row to the boxes' total width.
+        let rowWidth = (n - 1) * segGap + widths.reduce(0, +)
         if let c = segmentRowWidth { c.constant = rowWidth }
         else {
             let c = segmentRow.widthAnchor.constraint(equalToConstant: rowWidth)
@@ -638,12 +690,12 @@ final class TaskbarPanel: NSPanel {
         // Slide the active-group indicator to the current desktop's box. Animate only
         // when the set of boxes is unchanged (a pure desktop switch); snap otherwise
         // (boxes were added/removed/reordered, so a slide would look wrong).
-        let animate = activeDesktops == lastIndicatorDesktops
-        lastIndicatorDesktops = activeDesktops
+        let animate = desks == lastIndicatorDesktops
+        lastIndicatorDesktops = desks
         updateActiveIndicator(activeDesktop: current, animate: animate)
 
         if ProcessInfo.processInfo.environment["TBP_DEBUG"] != nil {
-            NSLog("GROUPED active=\(current) order=\(activeDesktops) avail=\(Int(switcherAvailableWidth())) segW=\(Int(segWidth))")
+            NSLog("GROUPED active=\(current) order=\(desks) avail=\(Int(totalAvail)) widths=\(widths.map { Int($0) })")
         }
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.18; ctx.allowsImplicitAnimation = true
@@ -720,84 +772,33 @@ final class TaskbarPanel: NSPanel {
             box.bottomAnchor.constraint(equalTo: segment.bottomAnchor, constant: -5),
         ])
 
-        // Align the windows within the box per the switcher's `align` config — in EVERY
-        // mode (don't hard-code right for split mode).
-        let segAlign: NSLayoutConstraint.Attribute
-        switch config.align(for: .switcher) {
-        case .left:   segAlign = .leading
-        case .center: segAlign = .centerX
-        case .right:  segAlign = .trailing
-        }
         let inner = NSStackView()
         inner.orientation = .vertical
-        inner.alignment = segAlign
+        inner.alignment = .leading
         inner.spacing = 3
-        // The inner stack hugs its content width (so centerX positioning is meaningful);
-        // don't let it stretch to fill the box.
-        inner.setContentHuggingPriority(.required, for: .horizontal)
         inner.translatesAutoresizingMaskIntoConstraints = false
         box.addSubview(inner)
-        // The segmentRow uses .fillEqually, which sets its own equal-width constraints,
-        // so this is only a low-priority hint (and must NOT fight fillEqually).
-        let widthC = box.widthAnchor.constraint(equalToConstant: width)
-        widthC.priority = .defaultLow
-        // Make the inner stack FILL the box's width (pinned to both edges), and let its
-        // own `alignment` (set above from segAlign) position the chip rows within that
-        // full width — leading / centerX / trailing. This is robust: it doesn't depend on
-        // a content-sized centerX pin resolving against the right box width (which raced
-        // during the switcher's layout pass and left content off-center).
-        var cons: [NSLayoutConstraint] = [
+        // This box's width (weighted by window count in rebuildGrouped). Breakable,
+        // like every switcher width (see CLAUDE.md "switcher off right edge").
+        let widthC = segment.widthAnchor.constraint(equalToConstant: width)
+        widthC.priority = .defaultHigh
+        NSLayoutConstraint.activate([
             widthC,
             box.heightAnchor.constraint(equalToConstant: height),
             inner.centerYAnchor.constraint(equalTo: box.centerYAnchor),
-            // Stay inside the box on both sides (loose), then position per align.
-            inner.leadingAnchor.constraint(greaterThanOrEqualTo: box.leadingAnchor, constant: 4),
+            inner.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 4),
             inner.trailingAnchor.constraint(lessThanOrEqualTo: box.trailingAnchor, constant: -4),
-        ]
-        switch segAlign {
-        case .leading:
-            cons.append(inner.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 4))
-        case .trailing:
-            cons.append(inner.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -4))
-        default:   // .centerX
-            cons.append(inner.centerXAnchor.constraint(equalTo: box.centerXAnchor))
-        }
-        NSLayoutConstraint.activate(cons)
+        ])
 
-        // Button width to fit within the segment; balance windows over two rows.
-        let innerAvail = width - 8
-        let spacing: CGFloat = 4
-        func fit(at w: CGFloat) -> Int { max(1, Int((innerAvail + spacing) / (w + spacing))) }
-        let perRowPref = fit(at: WindowButton.preferredWidth)
-        let perRowMin = fit(at: WindowButton.minWidth)
-        let count = windows.count
-        let perRow: Int, bw: CGFloat
-        if count <= perRowPref { perRow = max(count, 1); bw = WindowButton.preferredWidth }
-        else if count <= perRowPref * 2 { perRow = Int(ceil(Double(count)/2)); bw = WindowButton.preferredWidth }
-        else {
-            let shown = min(count, perRowMin * 2); perRow = Int(ceil(Double(shown)/2))
-            bw = max(WindowButton.minWidth, min(WindowButton.preferredWidth, (innerAvail - CGFloat(perRow-1)*spacing)/CGFloat(perRow)))
-        }
-
-        let row1 = NSStackView(); row1.orientation = .horizontal; row1.spacing = spacing
-        let row2 = NSStackView(); row2.orientation = .horizontal; row2.spacing = spacing
+        let row1 = NSStackView(); row1.orientation = .horizontal; row1.spacing = 4
+        let row2 = NSStackView(); row2.orientation = .horizontal; row2.spacing = 4
         inner.addArrangedSubview(row1); inner.addArrangedSubview(row2)
-
-        let shown = Array(windows.prefix(perRowMin * 2))
-        let topCount = min(perRow, shown.count)
-        for (i, w) in shown.enumerated() {
-            let btn = WindowButton(info: w, panel: self, width: bw)
-            btn.alphaValue = 0
-            (i < topCount ? row1 : row2).addArrangedSubview(btn)
-            newButtons.append(btn)
-        }
-        row2.isHidden = row2.arrangedSubviews.isEmpty
+        newButtons += fillRows([row1, row2], with: windows, avail: width - 8).buttons
         return (segment, box)
     }
 
-    /// Width available to ONE switcher row, given the switcher's zone and the space
-    /// the Dock sections consume. Buttons are sized to fill this so the strip never
-    /// overflows the screen, wherever the switcher is placed.
+    /// Width available to ONE switcher row, given the space the other sections
+    /// consume. Buttons are sized to fill this so the strip never overflows the screen.
     private func switcherAvailableWidth() -> CGFloat {
         let screenW = frame.width > 0 ? frame.width : (NSScreen.screens.first?.frame.width ?? 1512)
         let pad = Self.horizontalPadding
@@ -811,32 +812,24 @@ final class TaskbarPanel: NSPanel {
             return s.arrangedSubviews.isEmpty ? 0 : s.fittingSize.width
         }
 
-        // Split mode: the switcher spans from the launcher to the right edge. It may
+        // Taskbar-only mode: the switcher spans from the launcher to the right edge. It may
         // overlap the Dock region in the middle, but that's fine — the bar rests below
         // the Dock and rises above it on hover, so all windows are reachable. This lets
         // every window show instead of capping to a narrow strip.
-        if config.splitMode {
+        if config.taskbarOnly {
+            if !dockAtBottom {
+                // Centered on the screen's midpoint: the width is twice the room on
+                // the tighter side (launcher on the left, bar edge on the right).
+                let mid = frame.width / 2 + (centerXConstraint?.constant ?? 0)
+                let half = min(mid - (pad + zoneWidth(.left) + gap), screenW - pad - mid)
+                return max(WindowButton.minWidth, 2 * half)
+            }
             return max(WindowButton.minWidth, screenW - zoneWidth(.left) - 2 * pad - 2 * gap)
         }
 
-        let leftW = zoneWidth(.left)
-        let rightW = zoneWidth(.right)
-        // When expanding, the switcher is edge-anchored and uses the FULL gap between
-        // the flanking zones (regardless of its nominal zone).
-        if config.expand(for: .switcher) != nil {
-            return max(WindowButton.minWidth, screenW - leftW - rightW - 2 * pad - 2 * gap)
-        }
-        switch config.zone(for: .switcher) {
-        case .center:
-            // Centered in centerZone: it grows symmetrically, so it must stay clear of
-            // the WIDER neighbour on BOTH sides. Cap to the symmetric centered width so
-            // it never pushes a zone off-screen (which made the right zone vanish).
-            let half = screenW / 2 - max(leftW, rightW) - gap - pad
-            return max(WindowButton.minWidth, half * 2)
-        case .left, .right:
-            // Edge-anchored (expand): use the full gap between the two flanking zones.
-            return max(WindowButton.minWidth, screenW - leftW - rightW - 2 * pad - 2 * gap)
-        }
+        // Replace-Dock mode: the switcher expands over the full gap between the left
+        // icons and the right zone (folders + Trash).
+        return max(WindowButton.minWidth, screenW - zoneWidth(.left) - zoneWidth(.right) - 2 * pad - 2 * gap)
     }
 
     private func dockStacks() -> [NSStackView] { [pinnedStack, runningStack, othersStack] }
@@ -847,12 +840,11 @@ final class TaskbarPanel: NSPanel {
     /// Raise a specific window (task-switcher click).
     func raiseWindow(_ info: WindowInfo) {
         let onOther = onIsWindowOnOtherSpace?(info.windowNumber) ?? false
-        if onOther, info.desktopIndex >= 1 {
-            // The private Space-switch APIs are dead on macOS 26, but synthesizing the
-            // "switch to Desktop N" shortcut (Ctrl+N) still works. Switch to the
-            // window's desktop, then raise it once it's on-screen (AX can only see
-            // windows on the current Space).
-            DesktopSwitcher.switchTo(desktop: info.desktopIndex)
+        // The private Space-switch APIs are dead on macOS 26, but synthesizing the
+        // "switch to Desktop N" shortcut (Ctrl+N) still works. Switch to the window's
+        // desktop, then raise it once it's on-screen (AX can only see windows on the
+        // current Space). If that shortcut is off/missing, just raise (activates the app).
+        if onOther, info.desktopIndex >= 1, DesktopSwitcher.switchTo(desktop: info.desktopIndex) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
                 WindowControl.raise(windowNumber: info.windowNumber, pid: info.pid, title: info.title)
             }
@@ -1047,8 +1039,8 @@ final class DockIconView: NSView {
     private let imageView = NSImageView()
 
     /// The icon occupies the top `iconSize` square; the bottom 6pt holds the dot.
+    private let size: CGFloat
     private var iconRect: NSRect {
-        let size = TaskbarPanel.iconSize
         return NSRect(x: 0, y: bounds.height - size, width: size, height: size)
     }
 
@@ -1062,9 +1054,9 @@ final class DockIconView: NSView {
     init(item: DockItem, panel: TaskbarPanel) {
         self.item = item
         self.panel = panel
+        self.size = panel.iconSize
         super.init(frame: .zero)
 
-        let size = TaskbarPanel.iconSize
         imageView.image = item.icon
         imageView.imageScaling = .scaleProportionallyUpOrDown
         // Let mouse events fall through to this view so we can hit-test the badge.
@@ -1340,19 +1332,23 @@ final class WindowButton: NSView {
     }
 }
 
-/// Win95 Start-style launcher: a button that pops up the application menu built
-/// from /Applications + Utilities. Rebuilds the menu fresh on each click so newly
-/// installed apps show up.
+/// Win95 Start-style launcher: a button that pops up the application menu
+/// (Pre-Installed / Installed / Dock groups — see AppMenuBuilder). The menu is cached and
+/// rebuilt only when the app folders or Dock pins change.
 final class LauncherButton: NSView {
 
     private let builder = AppMenuBuilder()
     private let button = NSButton()
     private let desktopButton = NSButton()
+    /// Small magnifier that opens Spotlight, beside the desktop label.
+    private let spotlightButton = NSButton()
 
-    /// Called when the desktop label is clicked, to toggle current-Space ↔ all-Spaces.
+    /// Called when the desktop label is clicked, to cycle this desktop → all → grouped.
     var onToggleMode: (() -> Void)?
 
-    init() {
+    /// Compact (1-row bar): the desktop label sits right of the Apps button instead
+    /// of beneath it.
+    init(compact: Bool) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
 
@@ -1380,28 +1376,61 @@ final class LauncherButton: NSView {
         desktopButton.contentTintColor = .secondaryLabelColor
         desktopButton.target = self
         desktopButton.action = #selector(toggleMode)
-        desktopButton.toolTip = "Click to toggle current Desktop / All Desktops"
         desktopButton.translatesAutoresizingMaskIntoConstraints = false
         addSubview(desktopButton)
 
+        // Flat magnifier, same muted style as the desktop label.
+        let glass = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: "Spotlight")
+        spotlightButton.image = glass?.withSymbolConfiguration(
+            .init(pointSize: compact ? 11 : 9, weight: .semibold))
+        spotlightButton.isBordered = false
+        spotlightButton.bezelStyle = .inline
+        spotlightButton.imagePosition = .imageOnly
+        spotlightButton.contentTintColor = .secondaryLabelColor
+        spotlightButton.target = self
+        spotlightButton.action = #selector(openSpotlight)
+        spotlightButton.translatesAutoresizingMaskIntoConstraints = false
+        spotlightButton.setContentHuggingPriority(.required, for: .horizontal)
+        addSubview(spotlightButton)
+
+        if compact {
+            desktopButton.font = .systemFont(ofSize: 10)
+            NSLayoutConstraint.activate([
+                heightAnchor.constraint(equalToConstant: 26),
+                // [Apps] 🔍 Desk 1 — all on one line.
+                button.centerYAnchor.constraint(equalTo: centerYAnchor),
+                button.leadingAnchor.constraint(equalTo: leadingAnchor),
+                button.heightAnchor.constraint(equalToConstant: 24),
+                spotlightButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+                spotlightButton.leadingAnchor.constraint(equalTo: button.trailingAnchor, constant: 4),
+                desktopButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+                desktopButton.leadingAnchor.constraint(equalTo: spotlightButton.trailingAnchor, constant: 2),
+                desktopButton.trailingAnchor.constraint(equalTo: trailingAnchor),
+            ])
+            return
+        }
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: TaskbarPanel.iconSize),
-            // Apps button on top, desktop label centered beneath it.
+            heightAnchor.constraint(equalToConstant: 40),
+            // Apps button on top; beneath it, 🔍 then the desktop label.
             button.topAnchor.constraint(equalTo: topAnchor, constant: 4),
             button.leadingAnchor.constraint(equalTo: leadingAnchor),
             button.trailingAnchor.constraint(equalTo: trailingAnchor),
             button.heightAnchor.constraint(equalToConstant: 24),
+            spotlightButton.centerYAnchor.constraint(equalTo: desktopButton.centerYAnchor),
+            spotlightButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
             desktopButton.topAnchor.constraint(equalTo: button.bottomAnchor, constant: 0),
-            desktopButton.leadingAnchor.constraint(equalTo: leadingAnchor),
+            desktopButton.leadingAnchor.constraint(equalTo: spotlightButton.trailingAnchor, constant: 2),
             desktopButton.trailingAnchor.constraint(equalTo: trailingAnchor),
         ])
     }
+
+    @objc private func openSpotlight() { SystemShortcut.openSpotlight() }
 
     required init?(coder: NSCoder) { fatalError() }
 
     @objc private func toggleMode() { onToggleMode?() }
 
-    /// Update the desktop-name label (e.g. "Desktop 2" or "All Desktops").
+    /// Update the desktop-name label (e.g. "Desk 2" or "All Desks").
     func setDesktop(_ name: String) {
         desktopButton.title = name
     }
@@ -1411,12 +1440,87 @@ final class LauncherButton: NSView {
         if window != nil { builder.prewarm() }   // build the menu before first click
     }
 
+    // Tooltips for the desktop label and the Spotlight button. The bar is a non-key
+    // panel, so AppKit's `.toolTip` never fires — use the shared custom TooltipWindow
+    // (see CLAUDE.md).
+    private var tooltipTracking: [NSTrackingArea] = []
+    private lazy var tooltips: [(view: NSView, text: String)] = [
+        (desktopButton, "Click to cycle: this desktop / all desktops / grouped"),
+        (spotlightButton, "Spotlight search"),
+    ]
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        tooltipTracking.forEach { removeTrackingArea($0) }
+        tooltipTracking = tooltips.indices.map { i in
+            let t = NSTrackingArea(rect: tooltips[i].view.frame, options: [.mouseEnteredAndExited, .activeAlways],
+                                   owner: self, userInfo: ["tip": i])
+            addTrackingArea(t)
+            return t
+        }
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        guard let i = event.trackingArea?.userInfo?["tip"] as? Int, tooltips.indices.contains(i) else { return }
+        TooltipWindow.shared.show(tooltips[i].text, below: tooltips[i].view)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        TooltipWindow.shared.hide()
+    }
+
     @objc private func showMenu() {
         // Cached: only rebuilds when /Applications actually changed.
         let menu = builder.menu()
         // Pop up just above the button (the bar sits at the screen's bottom edge).
         let origin = NSPoint(x: 0, y: bounds.height + 4)
         menu.popUp(positioning: nil, at: origin, in: self)
+    }
+}
+
+/// "» N" button at the end of a switcher row (or grouped box) holding the windows
+/// that didn't fit; click lists them in a menu, choosing one raises it.
+final class OverflowButton: NSButton {
+    private let windows: [WindowInfo]
+    private weak var panel: TaskbarPanel?
+
+    init(windows: [WindowInfo], panel: TaskbarPanel) {
+        self.windows = windows
+        self.panel = panel
+        super.init(frame: .zero)
+        title = "» \(windows.count)"
+        font = .boldSystemFont(ofSize: 11)
+        bezelStyle = .rounded
+        controlSize = .small
+        target = self
+        action = #selector(showList)
+        translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 24),
+            widthAnchor.constraint(greaterThanOrEqualToConstant: WindowButton.minWidth),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    @objc private func showList() {
+        let menu = NSMenu()
+        for (i, w) in windows.enumerated() {
+            let item = NSMenuItem(title: w.displayTitle, action: #selector(pick(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = i
+            let icon = w.icon.copy() as? NSImage
+            icon?.size = NSSize(width: 16, height: 16)
+            item.image = icon
+            menu.addItem(item)
+        }
+        // Pop up just above the button (the bar sits at the screen's bottom edge).
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: bounds.height + 4), in: self)
+    }
+
+    @objc private func pick(_ sender: NSMenuItem) {
+        guard windows.indices.contains(sender.tag) else { return }
+        panel?.raiseWindow(windows[sender.tag])
     }
 }
 
@@ -1476,7 +1580,10 @@ final class TooltipWindow {
         let rect = anchorRect ?? view.bounds
         let onScreen = window.convertToScreen(view.convert(rect, to: nil))
         let width = label.intrinsicContentSize.width + 24
-        let x = onScreen.midX - width / 2
+        // Keep it on the bar's screen (long titles at the far edges would otherwise
+        // run off-screen or onto the next display).
+        let bounds = window.screen?.frame ?? onScreen
+        let x = min(max(onScreen.midX - width / 2, bounds.minX + 4), bounds.maxX - width - 4)
         // Anchor Y to the BAR's top edge, not the hovered item's rect — so every
         // tooltip (app icon, switcher chip, etc.) sits at the SAME height above the bar,
         // a single consistent place to read, like the Dock. Using the item rect made

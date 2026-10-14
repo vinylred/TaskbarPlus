@@ -11,9 +11,9 @@ final class DockModelService {
     /// Called on the main thread with the full ordered Dock model.
     var onChange: (([DockItem]) -> Void)?
 
-    /// In split mode the real Dock provides pinned/running/folders/Trash, so this
+    /// In taskbar-only mode the real Dock provides pinned/running/folders/Trash, so this
     /// model emits nothing (the bar shows only the launcher + switcher).
-    var splitMode = false { didSet { if splitMode != oldValue { rebuild() } } }
+    var taskbarOnly = false { didSet { if taskbarOnly != oldValue { rebuild() } } }
 
     private static let iconSize = NSSize(width: 40, height: 40)
 
@@ -69,33 +69,23 @@ final class DockModelService {
         rebuild()
     }
 
-    /// Estimated on-screen width of the REAL macOS Dock's visible icon strip, in
-    /// points — used to size the clear center gap in split mode. The Dock exposes no
-    /// rect (its window spans the whole screen), so estimate from tilesize × tile
-    /// count + the rounded-container end padding. Approximate but close; callers add
-    /// a safety margin. Returns 0 if the Dock isn't bottom-oriented or is auto-hidden.
-    func dockWidthEstimate() -> CGFloat {
-        let d = UserDefaults(suiteName: "com.apple.dock")
-        if (d?.string(forKey: "orientation") ?? "bottom") != "bottom" { return 0 }
-        if d?.bool(forKey: "autohide") == true { return 0 }
-        let tile = CGFloat(d?.integer(forKey: "tilesize") ?? 48)
-        let recents = (d?.array(forKey: "recent-apps") as? [[String: Any]])?.count ?? 0
-        let showRecents = d?.object(forKey: "show-recents") == nil || d?.bool(forKey: "show-recents") == true
-        // Tiles: pinned apps + folders + Trash + recents (if shown). Running apps DO get
-        // their own Dock tile, but counting them is unreliable (over-counts helpers and
-        // double-counts pinned), and it made the gap balloon → panels too narrow. Use
-        // the stable item count plus a modest running-app allowance.
-        let runningRegular = NSWorkspace.shared.runningApplications
-            .filter { $0.activationPolicy == .regular }.count
-        let pinnedBundleIDs = Set(pinned.compactMap { $0.bundleID?.lowercased() })
-        let runningNotPinned = max(0, runningRegular - pinnedBundleIDs.count)
-        let tiles = pinned.count + folders.count + 1 + (showRecents ? recents : 0) + runningNotPinned
-        guard tiles > 0 else { return 0 }
-        // ~tile per icon + a little inter-icon spacing + end padding.
-        return CGFloat(tiles) * (tile + 2) + tile
+    private func readDockPlist() {
+        let (apps, others) = Self.readDockArrays()
+        pinned = apps.compactMap { Self.parseApp($0) }
+        folders = others.compactMap { Self.parseFolder($0) }
+        // Dock config changed → app set may have changed; drop cached icons so they
+        // re-resolve once (e.g. an app was replaced/updated).
+        iconCache.removeAll()
     }
 
-    private func readDockPlist() {
+    /// The apps permanently kept in the real Dock, in Dock order (label + bundle URL).
+    /// Read fresh each call — used by the Start menu's "Dock" group.
+    static func dockPinnedApps() -> [(label: String, url: URL)] {
+        readDockArrays().apps.compactMap { parseApp($0) }.map { ($0.label, $0.url) }
+    }
+
+    /// Raw `persistent-apps` / `persistent-others` rows from the Dock's preferences.
+    private static func readDockArrays() -> (apps: [[String: Any]], others: [[String: Any]]) {
         CFPreferencesAppSynchronize("com.apple.dock" as CFString)
 
         var apps = (UserDefaults(suiteName: "com.apple.dock")?
@@ -113,15 +103,10 @@ final class DockModelService {
                 others = (root["persistent-others"] as? [[String: Any]]) ?? []
             }
         }
-
-        pinned = apps.compactMap { parseApp($0) }
-        folders = others.compactMap { parseFolder($0) }
-        // Dock config changed → app set may have changed; drop cached icons so they
-        // re-resolve once (e.g. an app was replaced/updated).
-        iconCache.removeAll()
+        return (apps, others)
     }
 
-    private func parseApp(_ entry: [String: Any]) -> ParsedApp? {
+    private static func parseApp(_ entry: [String: Any]) -> ParsedApp? {
         guard let tile = entry["tile-data"] as? [String: Any],
               let url = url(from: tile),
               FileManager.default.fileExists(atPath: url.path) else { return nil }
@@ -130,7 +115,7 @@ final class DockModelService {
         return ParsedApp(bundleID: bundleID, url: url, label: label)
     }
 
-    private func parseFolder(_ entry: [String: Any]) -> ParsedFolder? {
+    private static func parseFolder(_ entry: [String: Any]) -> ParsedFolder? {
         guard let tile = entry["tile-data"] as? [String: Any],
               let url = url(from: tile),
               FileManager.default.fileExists(atPath: url.path) else { return nil }
@@ -139,7 +124,7 @@ final class DockModelService {
     }
 
     /// Decode the percent-encoded `file://` URL nested under `file-data._CFURLString`.
-    private func url(from tile: [String: Any]) -> URL? {
+    private static func url(from tile: [String: Any]) -> URL? {
         guard let fileData = tile["file-data"] as? [String: Any],
               let str = fileData["_CFURLString"] as? String else { return nil }
         return URL(string: str)
@@ -196,8 +181,8 @@ final class DockModelService {
     // MARK: - Merge / dedup
 
     private func rebuild() {
-        // Split mode: the real Dock owns pinned/running/folders/Trash → emit nothing.
-        if splitMode {
+        // Taskbar-only mode: the real Dock owns pinned/running/folders/Trash → emit nothing.
+        if taskbarOnly {
             DispatchQueue.main.async { [weak self] in self?.onChange?([]) }
             return
         }

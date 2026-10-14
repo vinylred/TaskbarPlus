@@ -52,6 +52,18 @@ enum WindowControl {
         AXUIElementPerformAction(closeButton as! AXUIElement, kAXPressAction as CFString)
     }
 
+    /// Resize ONLY the given window (top-left stays put). Returns false if
+    /// Accessibility isn't granted, the window can't be matched, or the app refuses.
+    /// Exact CGWindowID match only — no title fallback: resizing a same-titled
+    /// sibling (e.g. another "Downloads" Finder window) would be destructive.
+    @discardableResult
+    static func setSize(_ size: CGSize, windowNumber: Int, pid: pid_t) -> Bool {
+        guard let window = axWindow(windowNumber: windowNumber, pid: pid, title: "") else { return false }
+        var s = size
+        guard let value = AXValueCreate(.cgSize, &s) else { return false }
+        return AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, value) == .success
+    }
+
     /// The AX window matching `windowNumber` (by CGWindowID), falling back to a title
     /// match — the AX window list doesn't always expose the CGWindowID for every
     /// window, which made some clicks no-op.
